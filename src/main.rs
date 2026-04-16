@@ -60,7 +60,7 @@ fn build_spl() -> anyhow::Result<()> {
 
     let args = &[
         "O=../u-boot-vf2-build",
-        "CROSS_COMPILE=riscv64-unknown-linux-gnu-",
+        "CROSS_COMPILE=riscv64-linux-gnu-",
         "ARCH=riscv",
     ];
     let invocations = [
