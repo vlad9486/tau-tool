@@ -140,7 +140,7 @@ pub fn build_tau() -> Result<(), BuildError> {
 }
 
 pub fn compose_tau_image() -> Result<Vec<u8>, ComposeError> {
-    let mut image = vec![0; 0x40000];
+    let mut image = vec![0; 0x200000];
     const SUPERVISOR_OFFSET: usize = 0x5000;
     const SYSTEM_OFFSET: usize = 0x10000;
     let path = "target/riscv64imac-unknown-none-elf/release/loader";

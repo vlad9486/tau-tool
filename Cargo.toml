@@ -12,3 +12,5 @@ gpt = { version = "4.1" }
 sudo = { version = "0.6.0" }
 uuid = { version = "1.26" }
 anyhow = { version = "1.0" }
+serde_json = "1.0"
+tempfile = "3"
