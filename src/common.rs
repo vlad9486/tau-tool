@@ -1,15 +1,10 @@
 use std::{
     cmp, fs, io,
-    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 
 use object::{Object, ObjectSegment};
 use thiserror::Error;
-
-#[derive(Debug, Error)]
-#[error("failed to clone {0}")]
-pub struct GitCloneError(String);
 
 #[derive(Debug, Error)]
 #[error("{file} {err}")]
@@ -140,9 +135,10 @@ pub fn build_tau() -> Result<(), BuildError> {
 }
 
 pub fn compose_tau_image() -> Result<Vec<u8>, ComposeError> {
-    let mut image = vec![0; 0x200000];
     const SUPERVISOR_OFFSET: usize = 0x5000;
     const SYSTEM_OFFSET: usize = 0x10000;
+
+    let mut image = vec![0; 0x200000];
     let path = "target/riscv64imac-unknown-none-elf/release/loader";
     let data = fs::read(path).map_err(|err| ComposeError::io(path, err))?;
     elf_to_raw(&data, &mut image[..SUPERVISOR_OFFSET])
@@ -153,27 +149,9 @@ pub fn compose_tau_image() -> Result<Vec<u8>, ComposeError> {
         .map_err(|err| ComposeError::err(path, err))?;
     let path = "target/riscv64imac-unknown-none-elf/release/system";
     let mut file = fs::File::open(path).map_err(|err| ComposeError::io(path, err))?;
-    io::copy(&mut file, &mut &mut image[SYSTEM_OFFSET..])
-        .map_err(|err| ComposeError::io(path, err))?;
+    let mut w = &mut image[SYSTEM_OFFSET..];
+    let copied = io::copy(&mut file, &mut w).map_err(|err| ComposeError::io(path, err))?;
+    image.truncate(SYSTEM_OFFSET + copied as usize);
 
     Ok(image)
-}
-
-pub fn git_clone<P>(path: P, link: &str, rev: &str, name: &str) -> io::Result<PathBuf>
-where
-    P: AsRef<Path>,
-{
-    let new = path.as_ref().to_owned().join(name);
-    if !new.exists() {
-        fs::create_dir_all(&path)?;
-        let out = Command::new("git")
-            .current_dir(&path)
-            .args(["clone", "--depth=1", "--rev", rev, link, name])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        bail(&out, || io::Error::other(name.to_string()))?;
-    }
-
-    Ok(new)
 }

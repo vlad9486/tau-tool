@@ -18,7 +18,7 @@ Then, from the OS repository after building its firmware:
 tau-builder debug
 ```
 
-This starts the existing OpenSBI payload in QEMU `virt`, with TCG, four harts,
+This starts the Tau QEMU firmware in QEMU `virt`, with TCG, four harts,
 and 4 GiB of RAM. QEMU starts paused. The tool loads supervisor symbols on the
 host, installs a hardware breakpoint at the supervisor ELF entry, and continues.
 On reaching that checkpoint it selects the stopping hart, walks the page tables,
@@ -38,7 +38,7 @@ It should be a supervisor checkpoint after the address-space switch. The default
 firmware and supervisor paths are:
 
 ```text
-target/opensbi-qemu/build/platform/generic/firmware/fw_payload.elf
+target/riscv64imac-unknown-none-elf/release/tau-qemu
 target/riscv64imac-unknown-none-elf/release/supervisor
 ```
 

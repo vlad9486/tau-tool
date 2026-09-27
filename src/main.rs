@@ -23,7 +23,7 @@ enum ArgsCommand {
         project_root: PathBuf,
         #[clap(
             long,
-            default_value = "target/opensbi-qemu/build/platform/generic/firmware/fw_payload.elf"
+            default_value = "target/riscv64imac-unknown-none-elf/release/tau-qemu"
         )]
         firmware: PathBuf,
         #[clap(
@@ -41,14 +41,15 @@ enum ArgsCommand {
         #[clap(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: u64,
     },
-    BuildFirmware,
     Format {
         #[clap(long)]
         path: PathBuf,
     },
-    BuildTau {
+    Build {
         #[clap(long)]
         qemu: bool,
+        #[clap(long)]
+        vf2: bool,
     },
     Update {
         #[clap(long)]
@@ -56,54 +57,21 @@ enum ArgsCommand {
     },
 }
 
-fn build_spl() -> anyhow::Result<()> {
-    const REVISION: &str = "c4c67bb66ae6f41c98537d18cf5c3abc8b97b8e4";
-    const REPO: &str = "https://github.com/starfive-tech/u-boot.git";
-    let dir = common::git_clone("target", REPO, REVISION, "u-boot-vf2")?;
-
-    let out_file = <str as AsRef<Path>>::as_ref("target/u-boot-vf2-build/spl/u-boot-spl.bin");
-    if out_file.exists() {
-        return Ok(());
-    }
-
-    Command::new("git")
-        .current_dir(&dir)
-        .args(["checkout", "."])
-        .output()?;
-    let out = Command::new("git")
-        .current_dir(&dir)
-        .args([
-            "apply",
-            "../../board/jh7110-starfive-visionfive-2-v1.3b-u-boot.patch",
-        ])
+fn build_rust_spl() -> anyhow::Result<()> {
+    let out = Command::new("cargo")
+        .args(["build", "--release", "--package=tau-visionfive2-spl"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()?;
-    common::bail(&out, || anyhow::anyhow!("apply u-boot patch"))?;
-
-    fs::create_dir("target/u-boot-vf2-build").unwrap_or_default();
-
-    let args = &[
-        "O=../u-boot-vf2-build",
-        "CROSS_COMPILE=riscv64-linux-gnu-",
-        "ARCH=riscv",
-    ];
-    let invocations = [
-        args.iter().copied().chain(Some("olddefconfig")),
-        args.iter()
-            .copied()
-            .chain(Some("starfive_visionfive2_defconfig")),
-        args.iter().copied().chain(None),
-    ];
-    for invocation in invocations {
-        let out = Command::new("make")
-            .current_dir(&dir)
-            .args(invocation)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        common::bail(&out, || anyhow::anyhow!("build u-boot"))?;
-    }
+    common::bail(&out, || anyhow::anyhow!("build spl for visionfive 2"))?;
+    let out = Command::new("rust-objcopy")
+        .args(["-O", "binary"])
+        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl")
+        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl.bin")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()?;
+    common::bail(&out, || anyhow::anyhow!("strip spl for visionfive 2"))?;
 
     Ok(())
 }
@@ -133,54 +101,48 @@ fn calc_spl_header(
     Ok(header)
 }
 
-fn build_opensbi() -> anyhow::Result<()> {
-    const REVISION: &str = "1725bd71080960290fdde4499a58c25c09d5c8ee";
-    const REPO: &str = "https://github.com/starfive-tech/opensbi.git";
-    let dir = common::git_clone("target", REPO, REVISION, "opensbi-vf2")?;
-
-    let out = Command::new("make")
-        .current_dir(dir)
+pub fn build_firmware_vf2() -> anyhow::Result<()> {
+    let image = common::compose_tau_image()?;
+    fs::write("target/tau", image)?;
+    let out = Command::new("cargo")
+        .env("TAU_SBI_PAYLOAD", "target/tau")
         .args([
-            "CC=clang",
-            "LD=ld.lld",
-            "LLVM=1",
-            "PLATFORM=generic",
-            "FW_FDT_PATH=../../board/jh7110-starfive-visionfive-2-v1.3b.dtb",
-            // "FW_PAYLOAD_PATH=../tau",
-            "FW_TEXT_START=0x40000000",
+            "build",
+            "--release",
+            "--package=tau-firmware",
+            "--bin=tau-visionfive2",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()?;
-    common::bail(&out, || anyhow::anyhow!("build opensbi for vf2"))?;
+    common::bail(&out, || anyhow::anyhow!("build rustsbi for visionfive 2"))?;
+    let out = Command::new("rust-objcopy")
+        .args(["-O", "binary"])
+        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2")
+        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2.bin")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()?;
+    common::bail(&out, || anyhow::anyhow!("strip rustsbi for visionfive 2"))?;
 
-    // "target/opensbi-vf2/build/platform/generic/firmware/fw_payload.bin"
     Ok(())
 }
 
-fn build_opensbi_qemu() -> anyhow::Result<()> {
-    const REVISION: &str = "74434f255873d74e56cc50aa762d1caf24c099f8";
-    const REPO: &str = "https://github.com/riscv-software-src/opensbi.git";
-    let dir = common::git_clone("target", REPO, REVISION, "opensbi-qemu")?;
+pub fn build_firmware_qemu() -> anyhow::Result<()> {
     let image = common::compose_tau_image()?;
     fs::write("target/tau", image)?;
-
-    let out = Command::new("make")
-        .current_dir(dir)
+    let out = Command::new("cargo")
+        .env("TAU_SBI_PAYLOAD", "target/tau")
         .args([
-            "CC=clang",
-            "LD=ld.lld",
-            "LLVM=1",
-            "PLATFORM=generic",
-            "FW_FDT_PATH=../../board/qemu-riscv-virt.dtb",
-            "FW_PAYLOAD_PATH=../tau",
-            "FW_TEXT_START=0x80000000",
+            "build",
+            "--release",
+            "--package=tau-firmware",
+            "--bin=tau-qemu",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()?;
-    common::bail(&out, || anyhow::anyhow!("build opensbi for qemu"))?;
-    // "target/opensbi-qemu/build/platform/generic/firmware/fw_payload.elf"
+    common::bail(&out, || anyhow::anyhow!("build rustsbi for qemu"))?;
 
     Ok(())
 }
@@ -205,7 +167,7 @@ where
     };
     disk.add_partition_at(name, 1, 4096, 4096, ty, 0)?;
 
-    let name = "starfive_visionfive_2_u-boot";
+    let name = "starfive_visionfive_2_tau";
     let ty = gpt::partition_types::Type {
         guid: uuid::Uuid::parse_str("5B193300-FC78-40CD-8002-E86C45580B47").expect("this is valid"),
         os: gpt::partition_types::OperatingSystem::None,
@@ -217,9 +179,9 @@ where
     let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(lb_size);
     mbr.overwrite_lba0(&mut file).unwrap();
 
-    let spl = fs::read("target/u-boot-vf2-build/spl/u-boot-spl.bin")?;
+    let spl = fs::read("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl.bin")?;
     let spl_header = calc_spl_header(&spl, None, None)?;
-    let open_sbi = fs::read("target/opensbi-vf2/build/platform/generic/firmware/fw_payload.bin")?;
+    let open_sbi = fs::read("target/riscv64imac-unknown-none-elf/release/tau-visionfive2.bin")?;
 
     file.seek(SeekFrom::Start(0x200000))?;
     file.write_all(&spl_header)?;
@@ -309,17 +271,20 @@ fn main() -> std::process::ExitCode {
             })?;
             vm.shutdown()
         })(),
-        ArgsCommand::BuildFirmware => build_spl().and_then(|()| build_opensbi()),
         ArgsCommand::Format { path } => format(path),
-        ArgsCommand::BuildTau { qemu } => {
-            if qemu {
-                common::build_tau()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|()| build_opensbi_qemu())
-            } else {
-                common::build_tau().map_err(anyhow::Error::from)
-            }
-        }
+        ArgsCommand::Build { qemu, vf2 } => common::build_tau()
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                if qemu {
+                    build_firmware_qemu()?;
+                }
+                if vf2 {
+                    build_rust_spl()?;
+                    build_firmware_vf2()?;
+                }
+
+                Ok(())
+            }),
         ArgsCommand::Update { path } => update(path),
     };
     if let Err(err) = res {

@@ -41,7 +41,7 @@ impl VmConfig {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
-            firmware: "target/opensbi-qemu/build/platform/generic/firmware/fw_payload.elf".into(),
+            firmware: "target/riscv64imac-unknown-none-elf/release/tau-qemu".into(),
             qemu: "qemu-system-riscv64".into(),
             gdb: "gdb-multiarch".into(),
             harts: 4,
