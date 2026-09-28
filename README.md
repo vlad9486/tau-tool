@@ -3,6 +3,17 @@
 Build tooling and a host-side QEMU/GDB debugger for Tau. Run the installed tool
 from the OS repository; build artifacts belong to that repository.
 
+## VisionFive 2 images
+
+`tau-builder build --vf2` produces the SPL and firmware ELF files
+(`tau-visionfive2-spl` and `tau-visionfive2`).
+
+`tau-builder format --path=/dev/sdX` reads these ELF files, converts their
+file-backed loadable segments into raw images in memory, and computes the SPL
+header before writing the SD card. Conversion uses load addresses, zero-fills
+gaps, omits trailing BSS, and checks image size limits. The command reformats the
+selected device.
+
 ## Test the OS
 
 From the OS repository, run:

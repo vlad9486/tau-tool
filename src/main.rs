@@ -8,6 +8,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 
+const SPL_MAX_SIZE: usize = 180048;
+const VF2_MAX_SIZE: usize = 0x400000;
+
 #[derive(Parser)]
 struct Args {
     #[clap(subcommand)]
@@ -42,14 +45,6 @@ fn build_spl() -> anyhow::Result<()> {
         .stderr(Stdio::inherit())
         .output()?;
     common::bail(&out, || anyhow::anyhow!("build spl for visionfive 2"))?;
-    let out = Command::new("rust-objcopy")
-        .args(["-O", "binary"])
-        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl")
-        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl.bin")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    common::bail(&out, || anyhow::anyhow!("strip spl for visionfive 2"))?;
 
     Ok(())
 }
@@ -59,7 +54,7 @@ fn calc_spl_header(
     backup_offset: Option<u32>,
     version: Option<u32>,
 ) -> anyhow::Result<[u8; 0x400]> {
-    if spl.len() > 180048 {
+    if spl.len() > SPL_MAX_SIZE {
         return Err(anyhow::anyhow!("spl too big"));
     }
     let c = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
@@ -84,6 +79,16 @@ where
     P: AsRef<Path>,
 {
     use std::io::{Write, SeekFrom, Seek};
+
+    // Prepare and validate both images before modifying the disk. Build outputs
+    // stay ELF; flat bytes exist only in memory when writing the SD card.
+    let binaries = build::Build::main(".").binaries();
+    let spl = common::elf_to_raw(
+        &fs::read(binaries.join("tau-visionfive2-spl"))?,
+        SPL_MAX_SIZE,
+    )?;
+    let spl_header = calc_spl_header(&spl, None, None)?;
+    let firmware = common::elf_to_raw(&fs::read(binaries.join("tau-visionfive2"))?, VF2_MAX_SIZE)?;
 
     sudo::escalate_if_needed().map_err(|err| anyhow::anyhow!("sudo: {err}"))?;
 
@@ -111,15 +116,11 @@ where
     let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(lb_size);
     mbr.overwrite_lba0(&mut file).unwrap();
 
-    let spl = fs::read("target/riscv64imac-unknown-none-elf/release/tau-visionfive2-spl.bin")?;
-    let spl_header = calc_spl_header(&spl, None, None)?;
-    let open_sbi = fs::read("target/riscv64imac-unknown-none-elf/release/tau-visionfive2.bin")?;
-
     file.seek(SeekFrom::Start(0x200000))?;
     file.write_all(&spl_header)?;
     file.write_all(&spl)?;
     file.seek(SeekFrom::Start(0x400000))?;
-    file.write_all(&open_sbi)?;
+    file.write_all(&firmware)?;
     file.sync_all()?;
 
     Ok(())
@@ -133,7 +134,7 @@ where
 
     sudo::escalate_if_needed().map_err(|err| anyhow::anyhow!("sudo: {err}"))?;
 
-    let image = common::compose_tau_image()?;
+    let image = build::Build::main(".").build_tau()?;
     let mut file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
     file.seek(SeekFrom::Start(0x200000))?;
     file.write_all(&image)?;

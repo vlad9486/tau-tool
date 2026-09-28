@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 use anyhow::{Context, Result};
-use crate::common::{self, BuildError};
+use crate::common::{self, BuildError, ComposeError};
 
 pub const TARGET: &str = "riscv64imac-unknown-none-elf";
 
@@ -79,10 +79,14 @@ impl Build {
         Ok(())
     }
 
+    pub fn build_tau(&self) -> Result<Vec<u8>, ComposeError> {
+        common::compose_tau_image_from(&self.binaries(), self.payload.binary())
+    }
+
     /// Compose already-built binaries and embed them into QEMU firmware.
     pub fn build_qemu(&self) -> Result<PathBuf> {
-        let image = common::compose_tau_image_from(&self.binaries(), self.payload.binary())?;
-        let payload_path = self.project_root.join("target/tau");
+        let image = self.build_tau()?;
+        let payload_path = self.binaries().join("tau");
         fs::write(&payload_path, image)?;
         let mut command = self.cargo();
         command
@@ -95,9 +99,10 @@ impl Build {
         firmware.canonicalize().context("resolve built firmware")
     }
 
-    pub fn build_vf2(&self) -> Result<()> {
-        let image = common::compose_tau_image_from(&self.binaries(), self.payload.binary())?;
-        let payload_path = self.project_root.join("target/tau");
+    /// Compose already-built binaries and return the VisionFive 2 firmware ELF.
+    pub fn build_vf2(&self) -> Result<PathBuf> {
+        let image = self.build_tau()?;
+        let payload_path = self.binaries().join("tau");
         fs::write(&payload_path, image)?;
         let mut command = self.cargo();
         command
@@ -106,21 +111,7 @@ impl Build {
         common::bail(&command.output()?, || {
             anyhow::anyhow!("build rustsbi for visionfive 2")
         })?;
-        let firmware = self
-            .binaries()
-            .join("tau-visionfive2")
-            .canonicalize()
-            .context("resolve built firmware")?;
-        let out = Command::new("rust-objcopy")
-            .current_dir(&self.project_root)
-            .args(["-O", "binary"])
-            .arg(&firmware)
-            .arg(firmware.with_extension("bin"))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()?;
-        common::bail(&out, || anyhow::anyhow!("strip rustsbi for visionfive 2"))?;
-
-        Ok(())
+        let firmware = self.binaries().join("tau-visionfive2");
+        firmware.canonicalize().context("resolve built firmware")
     }
 }
