@@ -1,14 +1,21 @@
-# tau-builder
+# tau-tool
 
-Build tooling and a host-side QEMU/GDB debugger for Tau. Run the installed tool
-from the OS repository; build artifacts belong to that repository.
+Build, test, and debug support for the Tau operating system. The `tau-tool`
+package provides the `tau` command and the `tau_tool` Rust library. Run the
+installed command from the OS repository; build artifacts belong to that repository.
+
+Install from this checkout:
+
+```sh
+cargo install --path .
+```
 
 ## VisionFive 2 images
 
-`tau-builder build --vf2` produces the SPL and firmware ELF files
+`tau build --vf2` produces the SPL and firmware ELF files
 (`tau-visionfive2-spl` and `tau-visionfive2`).
 
-`tau-builder format --path=/dev/sdX` reads these ELF files, converts their
+`tau format --path=/dev/sdX` reads these ELF files, converts their
 file-backed loadable segments into raw images in memory, and computes the SPL
 header before writing the SD card. Conversion uses load addresses, zero-fills
 gaps, omits trailing BSS, and checks image size limits. The command reformats the
@@ -19,10 +26,10 @@ selected device.
 From the OS repository, run:
 
 ```sh
-tau-builder test
-tau-builder test timer
-tau-builder test --list
-tau-builder test --project-root /path/to/tau --timeout 30
+tau test
+tau test timer
+tau test --list
+tau test --project-root /path/to/tau --timeout 30
 ```
 
 The optional filter matches substrings of scenario names. An unmatched filter is
@@ -53,7 +60,7 @@ cases and exits nonzero if any failed. Build errors stop the suite immediately.
 Both payloads use the default `target/riscv64imac-unknown-none-elf/release`
 directory, where `system` and `system-test` have distinct binary names. Image
 composition writes `target/tau` and rebuilds `tau-qemu` with the selected payload;
-run `tau-builder build --qemu` to switch back to the normal system image.
+run `tau build --qemu` to switch back to the normal system image.
 A file lock serializes test commands; ordinary builds should run separately
 from tests because they share firmware and symbol paths. Logs go under
 `target/tau-test/suite-*/<scenario>/run-*`, including best-effort diagnostics on
@@ -92,68 +99,24 @@ changes. The payload ELF entry is its manifest, so breakpoints use named code
 symbols rather than the ELF entry address. Existing `system` drivers are not
 automatically tested by replacing that payload.
 
-## Debug a supervisor checkpoint
-
-The debugger needs a Unix host, `qemu-system-riscv64`, and a RISC-V-capable GDB
-with MI3 support (for example `gdb-multiarch`). Install the tool from this checkout:
-
-```sh
-cargo install --path .
-```
-
-Then, from the OS repository after building its firmware:
-
-```sh
-tau-builder debug
-```
-
-This starts the Tau QEMU firmware in QEMU `virt`, with TCG, four harts,
-and 4 GiB of RAM. QEMU starts paused. The tool loads supervisor symbols on the
-host, installs a hardware breakpoint at the supervisor ELF entry, and continues.
-On reaching that checkpoint it selects the stopping hart, walks the page tables,
-checks that paging is enabled and the checkpoint is executable, prints the mapping
-and `stvec`, and shuts down. It does not require the other harts to run OS code.
-This is a finite boot check, not an interactive debugger terminal.
-
-Override the checkpoint or executable paths when needed:
-
-```sh
-tau-builder debug --at 0xffffffc000001000 --timeout 30 --gdb riscv64-linux-gnu-gdb
-tau-builder debug --project-root /path/to/tau
-```
-
-`--at` accepts a decimal or `0x` hexadecimal virtual address, including underscores.
-It should be a supervisor checkpoint after the address-space switch. The default
-firmware and supervisor paths are:
-
-```text
-target/riscv64imac-unknown-none-elf/release/tau-qemu
-target/riscv64imac-unknown-none-elf/release/supervisor
-```
-
-Use `--firmware` and `--supervisor` to override them. Relative paths resolve from
-`--project-root`, which defaults to the caller's working directory. The debugger
-does not rebuild the OS or create a ramdisk. Boot/test failures return a nonzero
-exit status.
-
 ## Rust API
 
-The `tau_builder::debugger` library manages QEMU and GDB child processes and talks
+The `tau_tool::debugger` library manages QEMU and GDB child processes and talks
 to QMP, GDB/MI, and the serial socket. No shell, Python, C++ bindings, or guest agent
-is involved. Add it as a dependency of a **host-target test crate** in the OS repo:
+is involved. OS test scenarios live in this host repository. To use the library
+from another host project, add:
 
 ```toml
 [dependencies]
-tau-builder = { path = "/path/to/tau-builder" }
+tau-tool = { path = "/path/to/tau-tool" }
 anyhow = "1"
 ```
 
-Build that test crate for the host, not `riscv64imac-unknown-none-elf`; if the OS's
-Cargo configuration defaults to RISC-V, pass `--target` with the host triple.
+Keep host projects separate from the RISC-V OS workspace.
 
 ```rust,no_run
 use std::{path::Path, time::Duration};
-use tau_builder::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig};
+use tau_tool::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig};
 
 fn check_boot(project: &Path) -> anyhow::Result<()> {
     let supervisor = ElfImage::read(project.join(
@@ -269,7 +232,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --test qemu_debugger -- --ignored
 ```
 
-After `tau-builder test` has built an OS checkout, also exercise the runner's
+After `tau test` has built an OS checkout, also exercise the runner's
 guest-failure and execution-timeout diagnostics against that payload:
 
 ```sh

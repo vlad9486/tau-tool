@@ -1,4 +1,4 @@
-use tau_builder::{common, build, testing};
+use tau_tool::{common, build, testing};
 
 use std::{
     fs,

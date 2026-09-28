@@ -358,17 +358,17 @@ mod tests {
         assert!(selected(Some("timre")).is_empty());
     }
 
-    // Opt-in regression against the actual payload. Run tau-builder test first;
+    // Opt-in regression against the actual payload. Run `tau test` first;
     // this deliberately sends an invalid scenario and withholds a completion
     // breakpoint, ensuring neither guest failure nor a hang can count as a pass.
     #[test]
     #[ignore = "requires TAU_TEST_PROJECT with built test artifacts, QEMU and GDB"]
     fn payload_failure_and_timeout_capture_diagnostics() -> Result<()> {
-        let root =
-            PathBuf::from(std::env::var_os("TAU_TEST_PROJECT").context(
-                "set TAU_TEST_PROJECT to the OS checkout after running tau-builder test",
-            )?)
-            .canonicalize()?;
+        let root = PathBuf::from(
+            std::env::var_os("TAU_TEST_PROJECT")
+                .context("set TAU_TEST_PROJECT to the OS checkout after running tau test")?,
+        )
+        .canonicalize()?;
         let build = Build::tests(&root);
         let lock = fs::OpenOptions::new()
             .write(true)

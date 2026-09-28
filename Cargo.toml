@@ -1,7 +1,11 @@
 [package]
-name = "tau-builder"
+name = "tau-tool"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "tau"
+path = "src/main.rs"
 
 [dependencies]
 object = { version = "0.40.0", default-features = false, features = ["read"] }

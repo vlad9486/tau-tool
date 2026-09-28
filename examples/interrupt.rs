@@ -4,7 +4,7 @@
 fn main() -> anyhow::Result<()> {
     use std::{path::PathBuf, time::Duration};
     use clap::{Parser, ValueEnum};
-    use tau_builder::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig, riscv};
+    use tau_tool::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig, riscv};
 
     #[derive(Clone, Copy, ValueEnum)]
     enum Source {

@@ -2,7 +2,7 @@
 
 use std::{fs, time::Duration};
 use anyhow::Result;
-use tau_builder::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig};
+use tau_tool::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig};
 
 /// Exercises real QEMU and GDB without requiring the separate OS repository or a cross compiler.
 #[test]
@@ -136,7 +136,8 @@ fn symbol_elf(code: &[u8]) -> Vec<u8> {
 #[test]
 #[ignore = "requires qemu-system-riscv64 and gdb-multiarch"]
 fn real_high_mapping_trap_entry_return_and_uart() -> Result<()> {
-    use tau_builder::debugger::riscv::PagingMode;
+    use tau_tool::debugger::riscv::PagingMode;
+
     const HIGH: u64 = 0xffff_ffc0_0000_0000;
     let root = tempfile::tempdir()?;
     fs::write(root.path().join("supervisor.bin"), supervisor_fixture())?;
