@@ -1,7 +1,4 @@
-use std::{
-    cmp, fs, io,
-    process::{Command, Output, Stdio},
-};
+use std::{cmp, fs, io, path::Path, process::Output};
 
 use object::{Object, ObjectSegment};
 use thiserror::Error;
@@ -96,61 +93,33 @@ fn elf_to_raw(data: &[u8], image: &mut [u8]) -> Result<(), ElfError> {
     Ok(())
 }
 
-pub fn build_tau() -> Result<(), BuildError> {
-    let out = Command::new("cargo")
-        .env("RUSTFLAGS", "-C relocation-model=pie")
-        .args([
-            "build",
-            "--release",
-            "--package=supervisor",
-            "--features=panic-never",
-            "--bin=loader",
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    bail(&out, || BuildError::Cargo)?;
-
-    let out = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--package=supervisor",
-            "--features=panic-never",
-            "--bin=supervisor",
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    bail(&out, || BuildError::Cargo)?;
-
-    let out = Command::new("cargo")
-        .args(["build", "--release", "--package=system", "--bin=system"])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    bail(&out, || BuildError::Cargo)?;
-
-    Ok(())
+pub fn compose_tau_image() -> Result<Vec<u8>, ComposeError> {
+    compose_tau_image_from(
+        Path::new("target/riscv64imac-unknown-none-elf/release"),
+        "system",
+    )
 }
 
-pub fn compose_tau_image() -> Result<Vec<u8>, ComposeError> {
+/// Compose the normal loader/supervisor with the selected user payload ELF.
+pub fn compose_tau_image_from(directory: &Path, payload: &str) -> Result<Vec<u8>, ComposeError> {
     const SUPERVISOR_OFFSET: usize = 0x5000;
     const SYSTEM_OFFSET: usize = 0x10000;
 
     let mut image = vec![0; 0x200000];
-    let path = "target/riscv64imac-unknown-none-elf/release/loader";
-    let data = fs::read(path).map_err(|err| ComposeError::io(path, err))?;
+    let path = directory.join("loader");
+    let data = fs::read(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
     elf_to_raw(&data, &mut image[..SUPERVISOR_OFFSET])
-        .map_err(|err| ComposeError::err(path, err))?;
-    let path = "target/riscv64imac-unknown-none-elf/release/supervisor";
-    let data = fs::read(path).map_err(|err| ComposeError::io(path, err))?;
+        .map_err(|err| ComposeError::err(&path.to_string_lossy(), err))?;
+    let path = directory.join("supervisor");
+    let data = fs::read(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
     elf_to_raw(&data, &mut image[SUPERVISOR_OFFSET..SYSTEM_OFFSET])
-        .map_err(|err| ComposeError::err(path, err))?;
-    let path = "target/riscv64imac-unknown-none-elf/release/system";
-    let mut file = fs::File::open(path).map_err(|err| ComposeError::io(path, err))?;
+        .map_err(|err| ComposeError::err(&path.to_string_lossy(), err))?;
+    let path = directory.join(payload);
+    let mut file =
+        fs::File::open(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
     let mut w = &mut image[SYSTEM_OFFSET..];
-    let copied = io::copy(&mut file, &mut w).map_err(|err| ComposeError::io(path, err))?;
+    let copied = io::copy(&mut file, &mut w)
+        .map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
     image.truncate(SYSTEM_OFFSET + copied as usize);
 
     Ok(image)

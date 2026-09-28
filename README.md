@@ -3,6 +3,84 @@
 Build tooling and a host-side QEMU/GDB debugger for Tau. Run the installed tool
 from the OS repository; build artifacts belong to that repository.
 
+## Test the OS
+
+From the OS repository, run:
+
+```sh
+tau-builder test
+tau-builder test timer
+tau-builder test --list
+tau-builder test --project-root /path/to/tau --timeout 30
+```
+
+The optional filter matches substrings of scenario names. An unmatched filter is
+an error. `--list` needs neither a build nor QEMU/GDB. Running tests requires
+`qemu-system-riscv64`, `gdb-multiarch` (override with `--qemu`/`--gdb`), and the OS
+Rust toolchain with the `riscv64imac-unknown-none-elf` target.
+
+The host runner and all host assertions live in this repository. The OS repository
+contains only RISC-V code: `3-U/test` builds a `system-test` payload in place of
+`system`, using the same manifest contract, loader, supervisor, and firmware.
+These are OS integration scenarios, not a guest Rust unit-test harness.
+
+The command builds once, then boots a **fresh VM per scenario**, with four harts
+and 4 GiB of RAM. It currently covers:
+
+| Scenario | Checks |
+| --- | --- |
+| `boot` | U-mode execution, user executable code mapping, boot arguments, valid DTB |
+| `mapping` | Map two pages through UBI; verify contents, distinct physical pages, user read/write and non-executable permissions |
+| `timer` | UBI wait returns a timeout after the requested guest-time deadline |
+| `fault` | Deliberate unmapped load traps from U-mode with the expected cause, address, and faulting instruction |
+
+The timeout bounds each case's execution including boot; startup and individual
+debugger commands have their own timeouts. A guest failure, unexpected stop,
+timeout, or VM startup error fails that case; the runner continues with remaining
+cases and exits nonzero if any failed. Build errors stop the suite immediately.
+
+Both payloads use the default `target/riscv64imac-unknown-none-elf/release`
+directory, where `system` and `system-test` have distinct binary names. Image
+composition writes `target/tau` and rebuilds `tau-qemu` with the selected payload;
+run `tau-builder build --qemu` to switch back to the normal system image.
+A file lock serializes test commands; ordinary builds should run separately
+from tests because they share firmware and symbol paths. Logs go under
+`target/tau-test/suite-*/<scenario>/run-*`, including best-effort diagnostics on
+execution failures. Each suite also retains `results.json`, updated after every
+case. The command prints the artifact path.
+
+### Payload protocol and adding scenarios
+
+Protocol v1 is intentionally small and independent of Rust's type layout. The
+payload exports `TAU_TEST_CONTROL`, three little-endian `u64` words: magic
+`0x5441555445535431`, version `1`, and a scenario ID initially `0`. At
+`tau_test_ready`, the host validates the header and writes the chosen scenario ID
+through the active hart's virtual address space. The payload reads it with a
+volatile load after resuming. A version or magic mismatch fails the test.
+
+Exported naked C functions give hardware breakpoints exact instruction addresses
+and stable argument registers, including under release LTO:
+
+| Symbol | Registers at entry |
+| --- | --- |
+| `tau_test_ready` | `a0`: boot hart ID |
+| `tau_test_progress` | `a0`: scenario ID; `a1`, `a2`: scenario-specific values |
+| `tau_test_passed` | `a0`: scenario ID; `a1`: result value |
+| `tau_test_failed` | `a0`: scenario ID; `a1`: failure code; `a2`: detail |
+
+Readiness/progress return when resumed; passed/failed are terminal loops. Panics
+report failure code `1` and the source line. Other codes are documented in
+`3-U/test/README.md` in the OS checkout. Reports do
+not depend on a syscall or UART output. The host owns VM shutdown; guest `exit`
+is not a success signal. For `fault`, validated trap entry is the success signal.
+
+To add a scenario, add a unique ID and payload branch in `3-U/test/src/main.rs`,
+then register its name and host assertions in `src/testing.rs`. Keep IDs and
+register meanings synchronized; bump the protocol version for incompatible
+changes. The payload ELF entry is its manifest, so breakpoints use named code
+symbols rather than the ELF entry address. Existing `system` drivers are not
+automatically tested by replacing that payload.
+
 ## Debug a supervisor checkpoint
 
 The debugger needs a Unix host, `qemu-system-riscv64`, and a RISC-V-capable GDB
@@ -178,6 +256,13 @@ commands directly can invalidate the debugger's tracked state.
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test --test qemu_debugger -- --ignored
+```
+
+After `tau-builder test` has built an OS checkout, also exercise the runner's
+guest-failure and execution-timeout diagnostics against that payload:
+
+```sh
+TAU_TEST_PROJECT=/path/to/tau cargo test --lib payload_failure_and_timeout -- --ignored
 ```
 
 The normal suite tests MI parsing, asynchronous stops, timeout recovery, physical

@@ -33,12 +33,24 @@ fn real_qemu_registers_memory_breakpoints_and_cleanup() -> Result<()> {
             0x8000_0000
         );
         dbg.add_symbols(&image, SymbolMapping::LoadAt(0x8000_0000))?;
+        assert_eq!(
+            image.symbol_address("checkpoint", SymbolMapping::LoadAt(0x8000_0000))?,
+            0x8000_0004
+        );
+        assert!(
+            image
+                .symbol_address("missing", SymbolMapping::Linked)
+                .is_err()
+        );
         let bp = dbg.hardware_breakpoint_symbol("checkpoint")?;
         let stop = dbg.run_to_breakpoint(&bp, Duration::from_secs(5))?;
         assert_eq!(stop.pc, Some(0x8000_0004));
         assert_eq!(dbg.read_register("s0")?, 42);
         assert_eq!(dbg.read_physical(0x8000_0000, 8)?, firmware);
         assert_eq!(dbg.read_virtual(0x8000_0000, 8)?, firmware);
+        dbg.write_virtual(0x8000_1000, &[0x12, 0x34, 0xab, 0xcd])?;
+        assert_eq!(dbg.read_virtual(0x8000_1000, 4)?, [0x12, 0x34, 0xab, 0xcd]);
+        assert_eq!(dbg.read_physical(0x8000_1000, 4)?, [0x12, 0x34, 0xab, 0xcd]);
         assert_eq!(dbg.translate(0, 0x8000_0000)?.physical_address, 0x8000_0000);
         dbg.remove_breakpoint(&bp)?;
         dbg.resume()?;

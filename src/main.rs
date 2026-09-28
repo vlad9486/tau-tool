@@ -1,4 +1,4 @@
-use tau_builder::common;
+use tau_builder::{common, build, testing};
 
 use std::{
     fs,
@@ -16,31 +16,9 @@ struct Args {
 
 #[derive(Subcommand)]
 enum ArgsCommand {
-    /// Boot QEMU to a supervisor checkpoint and inspect its virtual mapping.
+    /// Build system-test and run OS integration scenarios in fresh QEMU instances.
     #[cfg(unix)]
-    Debug {
-        #[clap(long, default_value = ".")]
-        project_root: PathBuf,
-        #[clap(
-            long,
-            default_value = "target/riscv64imac-unknown-none-elf/release/tau-qemu"
-        )]
-        firmware: PathBuf,
-        #[clap(
-            long,
-            default_value = "target/riscv64imac-unknown-none-elf/release/supervisor"
-        )]
-        supervisor: PathBuf,
-        /// Virtual checkpoint address; defaults to the supervisor ELF entry point.
-        #[clap(long, value_parser = parse_address)]
-        at: Option<u64>,
-        #[clap(long, default_value = "gdb")]
-        gdb: PathBuf,
-        #[clap(long, default_value = "qemu-system-riscv64")]
-        qemu: PathBuf,
-        #[clap(long, default_value = "30", value_parser = clap::value_parser!(u64).range(1..))]
-        timeout: u64,
-    },
+    Test(testing::TestArgs),
     Format {
         #[clap(long)]
         path: PathBuf,
@@ -57,7 +35,7 @@ enum ArgsCommand {
     },
 }
 
-fn build_rust_spl() -> anyhow::Result<()> {
+fn build_spl() -> anyhow::Result<()> {
     let out = Command::new("cargo")
         .args(["build", "--release", "--package=tau-visionfive2-spl"])
         .stdout(Stdio::inherit())
@@ -99,52 +77,6 @@ fn calc_spl_header(
     write_at(0xa4, checksum);
 
     Ok(header)
-}
-
-pub fn build_firmware_vf2() -> anyhow::Result<()> {
-    let image = common::compose_tau_image()?;
-    fs::write("target/tau", image)?;
-    let out = Command::new("cargo")
-        .env("TAU_SBI_PAYLOAD", "target/tau")
-        .args([
-            "build",
-            "--release",
-            "--package=tau-firmware",
-            "--bin=tau-visionfive2",
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    common::bail(&out, || anyhow::anyhow!("build rustsbi for visionfive 2"))?;
-    let out = Command::new("rust-objcopy")
-        .args(["-O", "binary"])
-        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2")
-        .arg("target/riscv64imac-unknown-none-elf/release/tau-visionfive2.bin")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    common::bail(&out, || anyhow::anyhow!("strip rustsbi for visionfive 2"))?;
-
-    Ok(())
-}
-
-pub fn build_firmware_qemu() -> anyhow::Result<()> {
-    let image = common::compose_tau_image()?;
-    fs::write("target/tau", image)?;
-    let out = Command::new("cargo")
-        .env("TAU_SBI_PAYLOAD", "target/tau")
-        .args([
-            "build",
-            "--release",
-            "--package=tau-firmware",
-            "--bin=tau-qemu",
-        ])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()?;
-    common::bail(&out, || anyhow::anyhow!("build rustsbi for qemu"))?;
-
-    Ok(())
 }
 
 fn format<P>(path: P) -> anyhow::Result<()>
@@ -210,77 +142,23 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
-fn parse_address(value: &str) -> Result<u64, String> {
-    let value = value.replace('_', "");
-    if let Some(hex) = value.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).map_err(|err| err.to_string())
-    } else {
-        value.parse::<u64>().map_err(|err| err.to_string())
-    }
-}
-
 fn main() -> std::process::ExitCode {
     let Args { command } = Args::parse();
+    let builder = build::Build::main(".");
     let res = match command {
         #[cfg(unix)]
-        ArgsCommand::Debug {
-            project_root,
-            firmware,
-            supervisor,
-            at,
-            gdb,
-            qemu,
-            timeout,
-        } => (|| -> anyhow::Result<()> {
-            use std::time::Duration;
-            use tau_builder::debugger::{ElfImage, SymbolMapping, TestVm, VmConfig};
-            use tau_builder::debugger::riscv::PagingMode;
-
-            let image = ElfImage::read(project_root.join(supervisor))?;
-            let mut config = VmConfig::new(project_root);
-            config.firmware = firmware;
-            config.gdb = gdb;
-            config.qemu = qemu;
-            let mut vm = TestVm::spawn(config)?;
-            println!("Debug logs: {}", vm.artifacts().display());
-            vm.check(|vm| {
-                let dbg = vm.debugger();
-                dbg.add_symbols(&image, SymbolMapping::Linked)?;
-                let address = at.unwrap_or(image.entry);
-                let breakpoint = dbg.hardware_breakpoint(address)?;
-                let stop = dbg.run_to_breakpoint(&breakpoint, Duration::from_secs(timeout))?;
-                dbg.remove_breakpoint(&breakpoint)?;
-                let satp = dbg.read_register("satp")?;
-                let mapping = dbg.translate(satp, address)?;
-                anyhow::ensure!(
-                    mapping.mode != PagingMode::Bare,
-                    "paging is disabled at supervisor checkpoint"
-                );
-                anyhow::ensure!(
-                    mapping.permissions.is_some_and(|p| p.execute),
-                    "supervisor checkpoint is not executable"
-                );
-                println!("Reached {address:#018x} on GDB thread {:?}", stop.thread_id);
-                println!(
-                    "satp={satp:#018x}; {:?} -> physical {:#x} (page size {:#x})",
-                    mapping.mode, mapping.physical_address, mapping.page_size
-                );
-                println!("stvec={:#018x}", dbg.read_register("stvec")?);
-                Ok(())
-            })?;
-            vm.shutdown()
-        })(),
+        ArgsCommand::Test(args) => testing::run(args),
         ArgsCommand::Format { path } => format(path),
-        ArgsCommand::Build { qemu, vf2 } => common::build_tau()
+        ArgsCommand::Build { qemu, vf2 } => builder
+            .build_payload()
             .map_err(anyhow::Error::from)
             .and_then(|()| {
                 if qemu {
-                    build_firmware_qemu()?;
+                    builder.build_qemu()?;
                 }
                 if vf2 {
-                    build_rust_spl()?;
-                    build_firmware_vf2()?;
+                    build_spl()?;
+                    builder.build_vf2()?;
                 }
 
                 Ok(())

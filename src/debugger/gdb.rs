@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use object::{Object, ObjectSegment};
+use object::{Object, ObjectSegment, ObjectSymbol};
 
 use super::{
     mi::{self, Record, Value},
@@ -50,6 +50,17 @@ impl ElfImage {
 
     pub fn runtime_entry(&self, mapping: SymbolMapping) -> u64 {
         self.entry.wrapping_add(mapping.offset(self))
+    }
+
+    /// Resolve an exact ELF symbol, without GDB language parsing or prologue skipping.
+    pub fn symbol_address(&self, name: &str, mapping: SymbolMapping) -> Result<u64> {
+        let bytes = fs::read(&self.path)?;
+        let elf = object::File::parse(bytes.as_slice())?;
+        let symbol = elf
+            .symbols()
+            .find(|s| s.is_definition() && s.name().ok() == Some(name))
+            .with_context(|| format!("missing symbol {name} in {}", self.path.display()))?;
+        Ok(symbol.address().wrapping_add(mapping.offset(self)))
     }
 }
 
@@ -587,7 +598,7 @@ impl Gdb {
             match self.packet(&format!("Qqemu.PhyMemMode:{old}")) {
                 Ok(reply) if reply == "OK" => {}
                 restore => bail!(
-                    "failed to restore QEMU memory mode: {restore:?}; read error: {:?}",
+                    "failed to restore QEMU memory mode: {restore:?}; operation error: {:?}",
                     result.as_ref().err()
                 ),
             }
@@ -632,6 +643,29 @@ impl Gdb {
 
     pub fn read_virtual(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         self.memory_mode(false, |gdb| gdb.read_memory(address, length))
+    }
+
+    /// Write through the selected hart's virtual translation context while stopped.
+    /// Like reads, restores QEMU's previous physical-memory mode even on failure.
+    pub fn write_virtual(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+        ensure!(
+            bytes.len() <= 1024 * 1024,
+            "write at most 1 MiB per request"
+        );
+        address
+            .checked_add(bytes.len() as u64)
+            .context("memory range overflows")?;
+        self.memory_mode(false, |gdb| {
+            if !bytes.is_empty() {
+                use std::fmt::Write as _;
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for byte in bytes {
+                    write!(hex, "{byte:02x}")?;
+                }
+                gdb.command(&format!("-data-write-memory-bytes {address:#x} {hex}"))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn read_physical(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
@@ -738,6 +772,8 @@ while IFS= read -r line; do
             printf '~"received: \"OK\"\\n"\n%s^done\n' "$token" ;;
         '-data-read-memory-bytes 0xdead 4')
             printf '%s^error,msg="unmapped memory"\n' "$token" ;;
+        '-data-write-memory-bytes 0xdead '*)
+            printf '%s^error,msg="unmapped memory"\n' "$token" ;;
         '-data-read-memory-bytes 0x1000 4')
             printf '%s^done,memory=[{begin="0x1000",end="0x1004",contents="' "$token"
             if [ "$mode" -eq 0 ]; then printf '01020304'; else printf 'aabbccdd'; fi
@@ -802,6 +838,20 @@ done
         assert!(error.is::<Timeout>(), "{error:#}");
         assert_eq!(gdb.state, State::Stopped);
         assert!(gdb.read_register("pc").is_ok());
+    }
+
+    #[test]
+    fn virtual_write_restores_mode_and_rejects_invalid_ranges() {
+        let (dir, mut gdb) = peer();
+        gdb.packet("Qqemu.PhyMemMode:1").unwrap();
+        gdb.write_virtual(0x1000, &[0, 0x12, 0xab, 0xff]).unwrap();
+        assert_eq!(gdb.packet("qqemu.PhyMemMode").unwrap(), "1");
+        assert!(gdb.write_virtual(0xdead, &[1]).is_err());
+        assert_eq!(gdb.packet("qqemu.PhyMemMode").unwrap(), "1");
+        assert!(gdb.write_virtual(u64::MAX, &[1]).is_err());
+        assert!(gdb.write_virtual(0, &vec![0; 1024 * 1024 + 1]).is_err());
+        let requests = fs::read_to_string(dir.path().join("gdb-requests.log")).unwrap();
+        assert!(requests.contains("-data-write-memory-bytes 0x1000 0012abff"));
     }
 
     #[test]
