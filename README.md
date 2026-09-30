@@ -21,6 +21,41 @@ header before writing the SD card. Conversion uses load addresses, zero-fills
 gaps, omits trailing BSS, and checks image size limits. The command reformats the
 selected device.
 
+## Static modules
+
+The OS checkout’s `2-S/modules.toml` defines ordered module offsets and reserved
+capacities in 4 KiB pages. `tau-tool` reads it on every build/composition; the
+loader’s build script compiles the same table into the loader. Overlapping,
+zero-sized, and oversized entries are rejected. The current loader requires the
+modules, a reserved 64 KiB boot DTB buffer, and its scratch pages to fit
+within the initial 2 MiB mapping.
+
+All listed binaries are built and packed. `loader` and `supervisor` are flattened;
+U-mode binaries remain ELF. `compose_tau_image_from` uses the active Rust
+toolchain’s `llvm-objcopy --strip-debug` to produce temporary packed copies.
+Install the `llvm-tools` component (already listed in the OS toolchain file).
+The original ELF files and Cargo’s `debug = 2`, `strip = "none"` remain unchanged.
+
+The loader copies the firmware DTB into reserved RAM and adds
+`/chosen/tau,modules`. Each U-mode module has a `module@<physical-address>` child
+with a `tau,name` string and a `reg` property containing a physical byte address
+and reserved byte length (two big-endian 32-bit cells each). Existing firmware
+properties, nodes, and memory reservations are preserved. An existing
+`tau,modules` subtree or insufficient buffer capacity is an error.
+
+Supervisor retains ELF loading, allocation, and module-table initialization.
+Both S-mode binaries use the same generated system/test selection constants.
+Supervisor forwards the new DTB address and page count through the original
+`a2`/`a3` boot arguments. `system` finds module ranges with `Dtb::boot_module`
+and maps them through `Area::sl`; there is no manifest or static-variable
+patching. The dummy `sdio` ELF is available as data and is not started.
+
+The DTB writer can be checked on the host against both board trees and malformed
+input with `cargo test --test dtb_writer -- --ignored`. After a normal QEMU
+build, `cargo test --test static_modules -- --ignored` checks the DTB passed to
+`system` against the configured module ranges. These checks use `dtc`/`fdtget`
+and default to the sibling OS checkout; set `TAU_TEST_PROJECT` to override it.
+
 ## Test the OS
 
 From the OS repository, run:
@@ -38,8 +73,9 @@ an error. `--list` needs neither a build nor QEMU/GDB. Running tests requires
 Rust toolchain with the `riscv64imac-unknown-none-elf` target.
 
 The host runner and all host assertions live in this repository. The OS repository
-contains only RISC-V code: `3-U/test` builds a `system-test` payload in place of
-`system`, using the same manifest contract, loader, supervisor, and firmware.
+contains the RISC-V programs: both `system` and `system-test` are packed into
+every image. Tests enable the loader’s `system-test` feature to select the latter,
+using the same manifest contract, supervisor, and firmware.
 These are OS integration scenarios, not a guest Rust unit-test harness.
 
 The command builds once, then boots a **fresh VM per scenario**, with four harts
@@ -47,7 +83,7 @@ and 4 GiB of RAM. It currently covers:
 
 | Scenario | Checks |
 | --- | --- |
-| `boot` | U-mode execution, user executable code mapping, boot arguments, valid DTB |
+| `boot` | U-mode execution, user executable code mapping, DTB boot arguments, discovery and mapping of all three U-mode ELFs |
 | `mapping` | Map two pages through UBI; verify contents, distinct physical pages, user read/write and non-executable permissions |
 | `timer` | UBI wait returns a timeout after the requested guest-time deadline |
 | `fault` | Deliberate unmapped load traps from U-mode with the expected cause, address, and faulting instruction |
@@ -59,7 +95,8 @@ cases and exits nonzero if any failed. Build errors stop the suite immediately.
 
 Both payloads use the default `target/riscv64imac-unknown-none-elf/release`
 directory, where `system` and `system-test` have distinct binary names. Image
-composition writes `target/tau` and rebuilds `tau-qemu` with the selected payload;
+composition writes `target/riscv64imac-unknown-none-elf/release/tau` and rebuilds
+`tau-qemu` with the selected loader;
 run `tau build --qemu` to switch back to the normal system image.
 A file lock serializes test commands; ordinary builds should run separately
 from tests because they share firmware and symbol paths. Logs go under
@@ -97,7 +134,7 @@ then register its name and host assertions in `src/testing.rs`. Keep IDs and
 register meanings synchronized; bump the protocol version for incompatible
 changes. The payload ELF entry is its manifest, so breakpoints use named code
 symbols rather than the ELF entry address. Existing `system` drivers are not
-automatically tested by replacing that payload.
+automatically tested by selecting the test payload.
 
 ## Rust API
 
@@ -156,8 +193,8 @@ Symbol mappings are independent for each ELF:
 
 Symbol loading never uploads or relocates guest memory. Keep the matching ELF
 files on the host, even when the boot payload contains only flat loader/supervisor
-bytes. Embedding the system ELF with debug sections is also supported by the
-existing build flow.
+bytes. Composition strips debug information only from the packed U-mode ELF copies;
+the original binaries retain their debug information.
 
 ## Interrupt tests
 

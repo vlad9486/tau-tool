@@ -63,10 +63,16 @@ impl Build {
     }
 
     pub fn build_payload(&self) -> Result<(), BuildError> {
-        for binary in ["loader", "supervisor", self.payload.binary()] {
+        let modules = crate::modules::Modules::read(&self.project_root.join("2-S/modules.toml"))
+            .map_err(|error| BuildError::Layout(format!("{error:#}")))?;
+        for module in modules.module {
+            let binary = module.name.as_str();
             let mut command = self.cargo();
             if binary == "loader" || binary == "supervisor" {
                 command.args(["--package=supervisor", "--features=panic-never"]);
+                if matches!(self.payload, Payload::Test) {
+                    command.arg("--features=system-test");
+                }
             } else {
                 command.arg(format!("--package={binary}"));
             }
@@ -80,7 +86,10 @@ impl Build {
     }
 
     pub fn build_tau(&self) -> Result<Vec<u8>, ComposeError> {
-        common::compose_tau_image_from(&self.binaries(), self.payload.binary())
+        common::compose_tau_image_from(
+            &self.binaries(),
+            &self.project_root.join("2-S/modules.toml"),
+        )
     }
 
     /// Compose already-built binaries and embed them into QEMU firmware.

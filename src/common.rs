@@ -1,4 +1,8 @@
-use std::{fs, io, path::Path, process::Output};
+use std::{
+    fs, io,
+    path::Path,
+    process::{Command, Output},
+};
 
 use object::{
     Object,
@@ -28,6 +32,10 @@ impl ComposeError {
 
 #[derive(Debug, Error)]
 pub enum ElfError {
+    #[error("module layout: {0}")]
+    Layout(String),
+    #[error("strip debug information: {0}")]
+    Strip(String),
     #[error("read error: {0}")]
     Read(#[from] io::Error),
     #[error("elf: {0}")]
@@ -47,6 +55,8 @@ pub enum ElfError {
 #[derive(Debug, Error)]
 #[error("build error")]
 pub enum BuildError {
+    #[error("module layout: {0}")]
+    Layout(String),
     #[error("invoke cargo error: {0}")]
     Invocation(#[from] io::Error),
     #[error("cargo error")]
@@ -112,36 +122,129 @@ pub fn elf_to_raw(data: &[u8], max_size: usize) -> Result<Vec<u8>, ElfError> {
     Ok(image)
 }
 
-/// Compose the normal loader/supervisor with the selected user payload ELF.
-pub fn compose_tau_image_from(directory: &Path, payload: &str) -> Result<Vec<u8>, ComposeError> {
-    const SUPERVISOR_OFFSET: usize = 0x5000;
-    const SYSTEM_OFFSET: usize = 0x10000;
+/// Strip a copy using the active Rust toolchain's LLVM tools. Never modify the
+/// original ELF: the debugger loads its symbols and source information.
+fn stripped_elf(path: &Path) -> Result<Vec<u8>, ElfError> {
+    let output = Command::new("rustc")
+        .args(["--print", "target-libdir"])
+        .output()?;
+    if !output.status.success() {
+        return Err(ElfError::Strip(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let libdir = String::from_utf8_lossy(&output.stdout);
+    let tool = Path::new(libdir.trim())
+        .parent()
+        .ok_or_else(|| ElfError::Strip("invalid rustc target-libdir".into()))?
+        .join("bin/llvm-objcopy");
+    let copy = tempfile::NamedTempFile::new()?;
+    let output = Command::new(&tool)
+        .arg("--strip-debug")
+        .arg(path)
+        .arg(copy.path())
+        .output()
+        .map_err(|error| {
+            ElfError::Strip(format!(
+                "{}: {error}; install the llvm-tools Rust component",
+                tool.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(ElfError::Strip(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(fs::read(copy.path())?)
+}
 
-    let mut image = vec![0; 0x200000];
-    let path = directory.join("loader");
-    let data = fs::read(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
-    let raw = elf_to_raw(&data, SUPERVISOR_OFFSET)
-        .map_err(|err| ComposeError::err(&path.to_string_lossy(), err))?;
-    image[..raw.len()].copy_from_slice(&raw);
-    let path = directory.join("supervisor");
-    let data = fs::read(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
-    let raw = elf_to_raw(&data, SYSTEM_OFFSET - SUPERVISOR_OFFSET)
-        .map_err(|err| ComposeError::err(&path.to_string_lossy(), err))?;
-    image[SUPERVISOR_OFFSET..SUPERVISOR_OFFSET + raw.len()].copy_from_slice(&raw);
-    let path = directory.join(payload);
-    let mut file =
-        fs::File::open(&path).map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
-    let mut w = &mut image[SYSTEM_OFFSET..];
-    let copied = io::copy(&mut file, &mut w)
-        .map_err(|err| ComposeError::io(&path.to_string_lossy(), err))?;
-    image.truncate(SYSTEM_OFFSET + copied as usize);
-
+/// Compose all static modules. S-mode binaries are flat images; U-mode modules
+/// remain ELF, with debug information removed only from the packed copy.
+pub fn compose_tau_image_from(directory: &Path, manifest: &Path) -> Result<Vec<u8>, ComposeError> {
+    let config = crate::modules::Modules::read(manifest).map_err(|error| {
+        ComposeError::err(
+            &manifest.to_string_lossy(),
+            ElfError::Layout(format!("{error:#}")),
+        )
+    })?;
+    let end = config
+        .module
+        .last()
+        .map_or(0, |m| (m.offset + m.size) << 12);
+    let mut image = vec![0; end];
+    for module in config.module {
+        let path = directory.join(&module.name);
+        let result = (|| {
+            let size = module.size << 12;
+            let bytes = if matches!(module.name.as_str(), "loader" | "supervisor") {
+                elf_to_raw(&fs::read(&path)?, size)?
+            } else {
+                stripped_elf(&path)?
+            };
+            if bytes.len() > size {
+                return Err(ElfError::ElfOutputTooSmall);
+            }
+            let start = module.offset << 12;
+            image[start..start + bytes.len()].copy_from_slice(&bytes);
+            Ok(())
+        })();
+        result.map_err(|err| ComposeError::err(&path.to_string_lossy(), err))?;
+    }
     Ok(image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripping_preserves_load_segments_and_original_debug_file() {
+        let mut data = fixture(&[(0x8020_0000, &[0x73, 0, 0, 0], 4)]);
+        let names = b"\0.text\0.debug_info\0.shstrtab\0";
+        let names_offset = data.len();
+        data.extend_from_slice(names);
+        let debug_offset = data.len();
+        data.extend_from_slice(b"debug fixture");
+        let table = data.len().next_multiple_of(8);
+        data.resize(table + 4 * 64, 0);
+        data[40..48].copy_from_slice(&(table as u64).to_le_bytes());
+        data[58..60].copy_from_slice(&64u16.to_le_bytes());
+        data[60..62].copy_from_slice(&4u16.to_le_bytes());
+        data[62..64].copy_from_slice(&3u16.to_le_bytes());
+        for (index, name, kind, flags, address, offset, size) in [
+            (1, 1u32, 1u32, 6u64, 0x8020_0000u64, 120, 4),
+            (2, 7, 1, 0, 0, debug_offset, 13),
+            (3, 19, 3, 0, 0, names_offset, names.len()),
+        ] {
+            let section = table + index * 64;
+            data[section..section + 4].copy_from_slice(&name.to_le_bytes());
+            data[section + 4..section + 8].copy_from_slice(&kind.to_le_bytes());
+            for (field, value) in [
+                (8, flags),
+                (16, address),
+                (24, offset as u64),
+                (32, size as u64),
+                (48, 1),
+            ] {
+                data[section + field..section + field + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("system");
+        fs::write(&path, &data).unwrap();
+        let stripped = stripped_elf(&path).unwrap();
+        let original = object::File::parse(data.as_slice()).unwrap();
+        let packed = object::File::parse(stripped.as_slice()).unwrap();
+        assert!(original.section_by_name(".debug_info").is_some());
+        assert!(packed.section_by_name(".debug_info").is_none());
+        assert_eq!(original.entry(), packed.entry());
+        assert_eq!(
+            elf_to_raw(&data, 4096).unwrap(),
+            elf_to_raw(&stripped, 4096).unwrap()
+        );
+        assert_eq!(fs::read(path).unwrap(), data);
+        assert!(stripped.len() < data.len());
+    }
 
     // Minimal RV64 ELF, deliberately without section headers: conversion uses
     // program headers only. Every virtual address differs from its load address.
