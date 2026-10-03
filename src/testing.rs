@@ -52,6 +52,10 @@ const CASES: &[Case] = &[
         name: "timer",
     },
     Case {
+        id: 5,
+        name: "invocation",
+    },
+    Case {
         id: 4,
         name: "fault",
     },
@@ -217,6 +221,25 @@ fn validate_control(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// QEMU suite uses 4 GiB (1M frames). Each allocator tree has eight u16
+// counters in a 64-byte cache line, following 2048 64-byte frame bitmaps.
+// Compare free-frame counts at quiescent guest checkpoints, not page addresses.
+fn free_frames(gdb: &mut Gdb, satp: u64) -> Result<u64> {
+    let tables = gdb
+        .translate(satp, 0xffff_ffc0_006e_0000 + 2048 * 64)?
+        .physical_address;
+    let data = gdb.read_physical(tables, 256 * 64)?;
+    Ok(data
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .flat_map(|tree| tree[..16].as_chunks::<2>().0.iter())
+        .map(|cell| u16::from_le_bytes(*cell))
+        .filter(|&count| count != u16::MAX)
+        .map(u64::from)
+        .sum())
+}
+
 fn exercise(
     gdb: &mut Gdb,
     supervisor: &ElfImage,
@@ -294,6 +317,112 @@ fn exercise(
                 extra >= value && value > 0,
                 "timer returned before its deadline"
             ),
+            5 => {
+                ensure!(
+                    value > 0 && value < 0x800 && extra == 0,
+                    "invalid prepared dependency slot"
+                );
+                // repr(C) ModuleTables: two bools, padding, then atomic slots.
+                let caller_root = gdb.read_register("satp")?;
+                let slot_address = gdb
+                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 8 + value * 8)?
+                    .physical_address;
+                let cell = gdb.read_physical(slot_address, 8)?;
+                let descriptor = u64::from_le_bytes(cell.try_into().unwrap()) & !(1 << 63);
+                ensure!(
+                    descriptor != 0 && descriptor & 0xfff == 0,
+                    "invalid descriptor"
+                );
+                // repr(C) immutable Dependency: stem, root index, entry, stack, tables.
+                let record = gdb.read_physical(descriptor, 40)?;
+                let entry = u64::from_le_bytes(record[16..24].try_into().unwrap());
+                let caller = gdb.read_register("satp")?;
+                let available_before = free_frames(gdb, caller)?;
+                let context_va = 0xffff_ffc0_0021_0000;
+                let thread_va = 0xffff_ffc0_0020_0000;
+                let caller_context = gdb.translate(caller, context_va)?.physical_address;
+                let caller_thread = gdb.translate(caller, thread_va)?.physical_address;
+                let caller_stack = gdb
+                    .translate(caller, 0xffff_ffc0_001f_fff0)?
+                    .physical_address;
+                let caller_code = gdb.translate(caller, entry)?.physical_address;
+                let destination = gdb.hardware_breakpoint(entry)?;
+                loop {
+                    until(gdb, &destination, &failed, deadline)
+                        .context("enter separate sdio address space")?;
+                    if gdb.read_register("satp")? != caller {
+                        break;
+                    }
+                }
+                let callee = gdb.read_register("satp")?;
+                let hart_mmu = gdb
+                    .translate(caller, 0xffff_ffc0_0000_6000)?
+                    .physical_address;
+                let mask_bytes = gdb.read_physical(hart_mmu, 2)?;
+                let mask = u16::from_le_bytes(mask_bytes.try_into().unwrap());
+                if mask != 0 {
+                    ensure!((callee >> 44) & 0xffff == 1, "callee lacks distinct ASID");
+                    ensure!((caller >> 44) & 0xffff == 0, "bootstrap tag changed");
+                }
+
+                ensure!(gdb.read_register("priv")? == 0, "callee is not in U-mode");
+                ensure!(
+                    gdb.translate(callee, entry)?
+                        .permissions
+                        .is_some_and(|p| p.user && p.execute && !p.write),
+                    "callee entry permissions"
+                );
+                ensure!(
+                    gdb.translate(callee, entry)?.physical_address != caller_code,
+                    "callee inherited caller ELF backing"
+                );
+                ensure!(
+                    gdb.translate(callee, context_va)?.physical_address != caller_context,
+                    "context pages are shared"
+                );
+                ensure!(
+                    gdb.translate(callee, thread_va)?.physical_address == caller_thread,
+                    "invoke created another thread"
+                );
+                ensure!(
+                    gdb.translate(callee, 0xffff_ffc0_001f_fff0)?
+                        .physical_address
+                        == caller_stack,
+                    "per-hart supervisor stack changed"
+                );
+                ensure!(
+                    gdb.translate(callee, u64::MAX - 15)?
+                        .permissions
+                        .is_some_and(|p| p.user && p.read && p.write && !p.execute),
+                    "missing private user stack"
+                );
+                ensure!(
+                    gdb.translate(callee, context_va)?
+                        .permissions
+                        .is_some_and(|p| !p.user),
+                    "context metadata is user accessible"
+                );
+                for name in [
+                    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "gp",
+                    "tp",
+                ] {
+                    ensure!(gdb.read_register(name)? == 0, "callee inherited {name}");
+                }
+                gdb.remove_breakpoint(&destination)?;
+                until(gdb, &passed, &failed, deadline)
+                    .context("complete repeated module invocations")?;
+                check_case(gdb, case)?;
+                ensure!(
+                    gdb.read_register("satp")? == caller,
+                    "return did not restore caller root"
+                );
+                ensure!(gdb.read_register("a1")? == 128, "wrong invocation count");
+                ensure!(
+                    free_frames(gdb, caller)? == available_before,
+                    "invocation/private mapping pages leaked"
+                );
+                return Ok(());
+            }
             4 => {
                 ensure!(value == 0x20_0000_0000, "unexpected fault address");
                 let stvec = gdb.read_register("stvec")?;
@@ -353,7 +482,8 @@ mod tests {
 
     #[test]
     fn selection_does_not_silently_run_everything_on_a_typo() {
-        assert_eq!(selected(None).len(), 4);
+        assert_eq!(selected(None).len(), 5);
+        assert_eq!(selected(Some("invocation"))[0].id, 5);
         assert_eq!(selected(Some("timer"))[0].id, 3);
         assert!(selected(Some("timre")).is_empty());
     }

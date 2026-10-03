@@ -80,6 +80,8 @@ where
 {
     use std::io::{Write, SeekFrom, Seek};
 
+    sudo::escalate_if_needed().map_err(|err| anyhow::anyhow!("sudo: {err}"))?;
+
     // Prepare and validate both images before modifying the disk. Build outputs
     // stay ELF; flat bytes exist only in memory when writing the SD card.
     let binaries = build::Build::main(".").binaries();
@@ -89,8 +91,6 @@ where
     )?;
     let spl_header = calc_spl_header(&spl, None, None)?;
     let firmware = common::elf_to_raw(&fs::read(binaries.join("tau-visionfive2"))?, VF2_MAX_SIZE)?;
-
-    sudo::escalate_if_needed().map_err(|err| anyhow::anyhow!("sudo: {err}"))?;
 
     let mut disk = gpt::GptConfig::default()
         .writable(true)

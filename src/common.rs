@@ -10,6 +10,8 @@ use object::{
 };
 use thiserror::Error;
 
+use super::modules;
+
 #[derive(Debug, Error)]
 #[error("{file} {err}")]
 pub struct ComposeError {
@@ -122,8 +124,8 @@ pub fn elf_to_raw(data: &[u8], max_size: usize) -> Result<Vec<u8>, ElfError> {
     Ok(image)
 }
 
-/// Strip a copy using the active Rust toolchain's LLVM tools. Never modify the
-/// original ELF: the debugger loads its symbols and source information.
+/// Strip non-runtime symbols and debug sections using the active LLVM tools.
+/// Never modify the original ELF: the debugger loads its symbols and source info.
 fn stripped_elf(path: &Path) -> Result<Vec<u8>, ElfError> {
     let output = Command::new("rustc")
         .args(["--print", "target-libdir"])
@@ -140,7 +142,7 @@ fn stripped_elf(path: &Path) -> Result<Vec<u8>, ElfError> {
         .join("bin/llvm-objcopy");
     let copy = tempfile::NamedTempFile::new()?;
     let output = Command::new(&tool)
-        .arg("--strip-debug")
+        .arg("--strip-all")
         .arg(path)
         .arg(copy.path())
         .output()
@@ -161,7 +163,7 @@ fn stripped_elf(path: &Path) -> Result<Vec<u8>, ElfError> {
 /// Compose all static modules. S-mode binaries are flat images; U-mode modules
 /// remain ELF, with debug information removed only from the packed copy.
 pub fn compose_tau_image_from(directory: &Path, manifest: &Path) -> Result<Vec<u8>, ComposeError> {
-    let config = crate::modules::Modules::read(manifest).map_err(|error| {
+    let config = modules::Modules::read(manifest).map_err(|error| {
         ComposeError::err(
             &manifest.to_string_lossy(),
             ElfError::Layout(format!("{error:#}")),
