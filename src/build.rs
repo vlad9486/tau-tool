@@ -94,9 +94,7 @@ impl Build {
 
     /// Compose already-built binaries and embed them into QEMU firmware.
     pub fn build_qemu(&self) -> Result<PathBuf> {
-        let image = self.build_tau()?;
         let payload_path = self.binaries().join("tau");
-        fs::write(&payload_path, image)?;
         let mut command = self.cargo();
         command
             .env("TAU_SBI_PAYLOAD", fs::canonicalize(payload_path)?)
@@ -110,9 +108,7 @@ impl Build {
 
     /// Compose already-built binaries and return the VisionFive 2 firmware ELF.
     pub fn build_vf2(&self) -> Result<PathBuf> {
-        let image = self.build_tau()?;
         let payload_path = self.binaries().join("tau");
-        fs::write(&payload_path, image)?;
         let mut command = self.cargo();
         command
             .env("TAU_SBI_PAYLOAD", fs::canonicalize(payload_path)?)

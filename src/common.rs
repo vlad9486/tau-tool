@@ -206,6 +206,7 @@ pub fn compose_tau_image_from(directory: &Path, manifest: &Path) -> Result<Vec<u
                 return Err(ElfError::ElfOutputTooSmall);
             }
             let start = module.offset << 12;
+            eprintln!("module: {}, size: {:04x}", module.name, bytes.len());
             image[start..start + bytes.len()].copy_from_slice(&bytes);
             Ok(())
         })();

@@ -42,8 +42,14 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { id: 7, name: "scheduling" },
-    Case { id: 8, name: "spawn-rollback" },
+    Case {
+        id: 7,
+        name: "scheduling",
+    },
+    Case {
+        id: 8,
+        name: "spawn-rollback",
+    },
     Case {
         id: 1,
         name: "boot",
@@ -124,6 +130,9 @@ pub fn run(args: TestArgs) -> Result<()> {
     lock.lock()?;
     let build = Build::tests(&root);
     build.build_payload()?;
+    let image = build.build_tau()?;
+    let payload_path = build.binaries().join("tau");
+    fs::write(&payload_path, image)?;
     let firmware = build.build_qemu()?;
     let supervisor = ElfImage::read(build.binaries().join("supervisor"))?;
     let payload = ElfImage::read(build.binaries().join("system-test"))?;
@@ -351,20 +360,39 @@ fn exercise(
                 gdb.write_physical(hart_mmu + 8, &(u64::from(maximum) + 1).to_le_bytes())?;
                 let checkpoint = breakpoint(gdb, payload, "tau_test_progress")?;
                 until(gdb, &checkpoint, &failed, deadline).context("reject spawn without ASID")?;
-                ensure!(gdb.read_register("a2")? == 1, "wrong post-failure checkpoint");
-                ensure!(gdb.read_register("satp")? == satp, "failed spawn switched roots");
-                ensure!(free_frames(gdb, satp)? == before, "failed spawn leaked pages");
-                ensure!(physical_word(gdb, hart_mmu + 8)? == u64::from(maximum) + 1,
-                    "failed spawn consumed an ASID");
+                ensure!(
+                    gdb.read_register("a2")? == 1,
+                    "wrong post-failure checkpoint"
+                );
+                ensure!(
+                    gdb.read_register("satp")? == satp,
+                    "failed spawn switched roots"
+                );
+                ensure!(
+                    free_frames(gdb, satp)? == before,
+                    "failed spawn leaked pages"
+                );
+                ensure!(
+                    physical_word(gdb, hart_mmu + 8)? == u64::from(maximum) + 1,
+                    "failed spawn consumed an ASID"
+                );
                 gdb.write_physical(hart_mmu, &mask)?;
                 gdb.write_physical(hart_mmu + 8, &next)?;
                 gdb.remove_breakpoint(&checkpoint)?;
             }
             7 => {
-                ensure!(value & 63 == 0 && extra == 8, "invalid wait table checkpoint");
-                let flags = gdb.translate(satp, value)?.permissions.context("missing wait table")?;
-                ensure!(flags.user && flags.read && flags.write && !flags.execute,
-                    "wait table has incorrect permissions");
+                ensure!(
+                    value & 63 == 0 && extra == 8,
+                    "invalid wait table checkpoint"
+                );
+                let flags = gdb
+                    .translate(satp, value)?
+                    .permissions
+                    .context("missing wait table")?;
+                ensure!(
+                    flags.user && flags.read && flags.write && !flags.execute,
+                    "wait table has incorrect permissions"
+                );
             }
             6 => {
                 ensure!(extra == 0, "wrong graph construction checkpoint");
@@ -845,8 +873,14 @@ fn exercise(
     until(gdb, &passed, &failed, deadline).context("reach success checkpoint")?;
     check_case(gdb, case)?;
     if case.id == 7 {
-        ensure!(gdb.read_register("a1")? == 128, "wrong scheduling round count");
-        ensure!(gdb.read_register("satp")? == satp, "scheduler did not restore initial context");
+        ensure!(
+            gdb.read_register("a1")? == 128,
+            "wrong scheduling round count"
+        );
+        ensure!(
+            gdb.read_register("satp")? == satp,
+            "scheduler did not restore initial context"
+        );
     }
     if case.id == 1 {
         ensure!(gdb.read_register("a1")? == hart, "boot hart changed");

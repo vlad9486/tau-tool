@@ -154,6 +154,10 @@ fn main() -> std::process::ExitCode {
             .build_payload()
             .map_err(anyhow::Error::from)
             .and_then(|()| {
+                let image = builder.build_tau()?;
+                let payload_path = builder.binaries().join("tau");
+                fs::write(&payload_path, image)?;
+
                 if qemu {
                     builder.build_qemu()?;
                 }
