@@ -645,9 +645,7 @@ impl Gdb {
         self.memory_mode(false, |gdb| gdb.read_memory(address, length))
     }
 
-    /// Write through the selected hart's virtual translation context while stopped.
-    /// Like reads, restores QEMU's previous physical-memory mode even on failure.
-    pub fn write_virtual(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+    fn write_memory(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         ensure!(
             bytes.len() <= 1024 * 1024,
             "write at most 1 MiB per request"
@@ -655,17 +653,25 @@ impl Gdb {
         address
             .checked_add(bytes.len() as u64)
             .context("memory range overflows")?;
-        self.memory_mode(false, |gdb| {
-            if !bytes.is_empty() {
-                use std::fmt::Write as _;
-                let mut hex = String::with_capacity(bytes.len() * 2);
-                for byte in bytes {
-                    write!(hex, "{byte:02x}")?;
-                }
-                gdb.command(&format!("-data-write-memory-bytes {address:#x} {hex}"))?;
+        if !bytes.is_empty() {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                write!(hex, "{byte:02x}")?;
             }
-            Ok(())
-        })
+            self.command(&format!("-data-write-memory-bytes {address:#x} {hex}"))?;
+        }
+        Ok(())
+    }
+
+    /// Write through the selected hart's virtual translation context while stopped.
+    /// Like reads, restores QEMU's previous physical-memory mode even on failure.
+    pub fn write_virtual(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+        self.memory_mode(false, |gdb| gdb.write_memory(address, bytes))
+    }
+
+    pub fn write_physical(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
+        self.memory_mode(true, |gdb| gdb.write_memory(address, bytes))
     }
 
     pub fn read_physical(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {

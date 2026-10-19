@@ -6,10 +6,13 @@ use std::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
-use crate::{
+use super::{
     build::Build,
     debugger::{Breakpoint, ElfImage, Gdb, SymbolMapping, TestVm, VmConfig, riscv},
 };
+
+#[cfg(test)]
+use super::debugger::Timeout;
 
 const MAGIC: u64 = 0x5441_5554_4553_5431;
 const VERSION: u64 = 1;
@@ -39,6 +42,8 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
+    Case { id: 7, name: "scheduling" },
+    Case { id: 8, name: "spawn-rollback" },
     Case {
         id: 1,
         name: "boot",
@@ -54,6 +59,10 @@ const CASES: &[Case] = &[
     Case {
         id: 5,
         name: "invocation",
+    },
+    Case {
+        id: 6,
+        name: "graph",
     },
     Case {
         id: 4,
@@ -240,6 +249,20 @@ fn free_frames(gdb: &mut Gdb, satp: u64) -> Result<u64> {
         .sum())
 }
 
+fn physical_word(gdb: &mut Gdb, address: u64) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        gdb.read_physical(address, 8)?.try_into().unwrap(),
+    ))
+}
+
+fn dependency_root(gdb: &mut Gdb, root: u64, slot: u64) -> Result<u64> {
+    // repr(C) ModuleContext: 32 registers, five header words, then roots.
+    let address = gdb
+        .translate(root, 0xffff_ffc0_0021_0000 + (37 + slot) * 8)?
+        .physical_address;
+    physical_word(gdb, address)
+}
+
 fn exercise(
     gdb: &mut Gdb,
     supervisor: &ElfImage,
@@ -317,10 +340,191 @@ fn exercise(
                 extra >= value && value > 0,
                 "timer returned before its deadline"
             ),
+            8 => {
+                ensure!(extra == 0, "wrong spawn rollback checkpoint");
+                let before = free_frames(gdb, satp)?;
+                let hart_mmu = gdb.translate(satp, 0xffff_ffc0_0000_6000)?.physical_address;
+                let mask = gdb.read_physical(hart_mmu, 2)?;
+                let next = gdb.read_physical(hart_mmu + 8, 8)?;
+                let maximum = u16::from_le_bytes(mask.clone().try_into().unwrap()).max(1);
+                gdb.write_physical(hart_mmu, &maximum.to_le_bytes())?;
+                gdb.write_physical(hart_mmu + 8, &(u64::from(maximum) + 1).to_le_bytes())?;
+                let checkpoint = breakpoint(gdb, payload, "tau_test_progress")?;
+                until(gdb, &checkpoint, &failed, deadline).context("reject spawn without ASID")?;
+                ensure!(gdb.read_register("a2")? == 1, "wrong post-failure checkpoint");
+                ensure!(gdb.read_register("satp")? == satp, "failed spawn switched roots");
+                ensure!(free_frames(gdb, satp)? == before, "failed spawn leaked pages");
+                ensure!(physical_word(gdb, hart_mmu + 8)? == u64::from(maximum) + 1,
+                    "failed spawn consumed an ASID");
+                gdb.write_physical(hart_mmu, &mask)?;
+                gdb.write_physical(hart_mmu + 8, &next)?;
+                gdb.remove_breakpoint(&checkpoint)?;
+            }
+            7 => {
+                ensure!(value & 63 == 0 && extra == 8, "invalid wait table checkpoint");
+                let flags = gdb.translate(satp, value)?.permissions.context("missing wait table")?;
+                ensure!(flags.user && flags.read && flags.write && !flags.execute,
+                    "wait table has incorrect permissions");
+            }
+            6 => {
+                ensure!(extra == 0, "wrong graph construction checkpoint");
+                let snapshot = gdb.read_virtual(value, 9 * 8)?;
+                let words: Vec<u64> = snapshot
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|word| u64::from_le_bytes(*word))
+                    .collect();
+                let descriptors: Vec<u64> = words[..4].iter().map(|ppn| ppn << 12).collect();
+                let slots = &words[4..];
+                ensure!(
+                    slots.iter().all(|slot| *slot > 0 && *slot < 0x800),
+                    "invalid graph slots"
+                );
+                for (index, descriptor) in descriptors.iter().enumerate() {
+                    ensure!(
+                        *descriptor != 0 && !descriptors[..index].contains(descriptor),
+                        "duplicate module handle"
+                    );
+                }
+                let records: Vec<Vec<u8>> = descriptors
+                    .iter()
+                    .map(|descriptor| gdb.read_physical(*descriptor, 40))
+                    .collect::<Result<_>>()?;
+                let field = |module: usize, offset: usize| {
+                    u64::from_le_bytes(records[module][offset..offset + 8].try_into().unwrap())
+                };
+                let caller = gdb.read_register("satp")?;
+                for (slot, descriptor) in [(slots[0], descriptors[0]), (slots[1], descriptors[1])] {
+                    let address = gdb
+                        .translate(caller, 0xffff_ffc0_0022_0008 + slot * 8)?
+                        .physical_address;
+                    ensure!(
+                        physical_word(gdb, address)? == descriptor | (1 << 63),
+                        "wrong root binding"
+                    );
+                    ensure!(
+                        dependency_root(gdb, caller, slot)? == 0,
+                        "graph construction created a context"
+                    );
+                }
+                for (parent, slot, child) in [(0, slots[2], 2), (1, slots[3], 2), (2, slots[4], 3)]
+                {
+                    ensure!(
+                        physical_word(gdb, field(parent, 32) + 8 + slot * 8)?
+                            == descriptors[child] | (1 << 63),
+                        "wrong graph binding"
+                    );
+                }
+                ensure!(
+                    field(0, 0) != field(1, 0),
+                    "fresh preparations shared ELF backing"
+                );
+                ensure!(
+                    field(0, 32) != field(1, 32),
+                    "fresh preparations shared module tables"
+                );
+
+                let warm = breakpoint(gdb, payload, "tau_test_progress")?;
+                until(gdb, &warm, &failed, deadline).context("walk both graph paths")?;
+                check_case(gdb, case)?;
+                ensure!(
+                    gdb.read_register("a1")? == value && gdb.read_register("a2")? == 1,
+                    "wrong graph warm checkpoint"
+                );
+                gdb.remove_breakpoint(&warm)?;
+                let a = dependency_root(gdb, caller, slots[0])?;
+                let b = dependency_root(gdb, caller, slots[1])?;
+                let service_a = dependency_root(gdb, a, slots[2])?;
+                let service_b = dependency_root(gdb, b, slots[3])?;
+                let leaf_a = dependency_root(gdb, service_a, slots[4])?;
+                let leaf_b = dependency_root(gdb, service_b, slots[4])?;
+                let contexts = [a, b, service_a, service_b, leaf_a, leaf_b];
+                for (index, root) in contexts.iter().enumerate() {
+                    ensure!(
+                        *root != 0 && !contexts[..index].contains(root),
+                        "graph paths shared a private context"
+                    );
+                }
+                for (root, module) in [
+                    (a, 0),
+                    (b, 1),
+                    (service_a, 2),
+                    (service_b, 2),
+                    (leaf_a, 3),
+                    (leaf_b, 3),
+                ] {
+                    let tables = gdb.translate(root, 0xffff_ffc0_0022_0000)?;
+                    ensure!(
+                        tables.physical_address == field(module, 32),
+                        "context has wrong shared tables"
+                    );
+                    ensure!(
+                        tables.permissions.is_some_and(|p| !p.user),
+                        "module tables accessible to userspace"
+                    );
+                    let metadata = gdb.translate(root, 0xffff_ffc0_0021_0000)?.physical_address;
+                    ensure!(
+                        physical_word(gdb, metadata + 35 * 8)? == root,
+                        "wrong context root"
+                    );
+                    ensure!(
+                        physical_word(gdb, metadata + 33 * 8)? == 0,
+                        "idle graph context retains caller"
+                    );
+                }
+                for (first, second, module) in [(service_a, service_b, 2), (leaf_a, leaf_b, 3)] {
+                    ensure!(
+                        gdb.translate(first, field(module, 16))?.physical_address
+                            == gdb.translate(second, field(module, 16))?.physical_address,
+                        "shared graph module has different ELF backing"
+                    );
+                    ensure!(
+                        gdb.translate(first, u64::MAX - 7)?.physical_address
+                            != gdb.translate(second, u64::MAX - 7)?.physical_address,
+                        "graph paths share private stacks"
+                    );
+                }
+                let available = free_frames(gdb, caller)?;
+                until(gdb, &passed, &failed, deadline)
+                    .context("complete graph walks and slot exhaustion")?;
+                check_case(gdb, case)?;
+                ensure!(gdb.read_register("a1")? == 128, "wrong graph walk count");
+                ensure!(
+                    gdb.read_register("satp")? == caller,
+                    "graph walk did not restore root"
+                );
+                ensure!(
+                    free_frames(gdb, caller)? == available,
+                    "warm graph walks or failed preparation leaked pages"
+                );
+                for (parent, slot, expected) in [
+                    (caller, slots[0], a),
+                    (caller, slots[1], b),
+                    (a, slots[2], service_a),
+                    (b, slots[3], service_b),
+                    (service_a, slots[4], leaf_a),
+                    (service_b, slots[4], leaf_b),
+                ] {
+                    ensure!(
+                        dependency_root(gdb, parent, slot)? == expected,
+                        "warm graph walk replaced a context"
+                    );
+                }
+                ensure!(
+                    physical_word(gdb, field(1, 32) + 8)? == 0x800,
+                    "exhausted table has wrong free-list head"
+                );
+                ensure!(
+                    physical_word(gdb, field(1, 32) + 8 + 0x7ff * 8)? == descriptors[2] | (1 << 63),
+                    "last binding did not reuse service descriptor"
+                );
+                return Ok(());
+            }
             5 => {
                 ensure!(
-                    value > 0 && value < 0x800 && extra == 0,
-                    "invalid prepared dependency slot"
+                    value > 0 && value < 0x800 && extra > 0 && extra < 0x800 && value != extra,
+                    "invalid prepared dependency slots"
                 );
                 // repr(C) ModuleTables: two bools, padding, then atomic slots.
                 let caller_root = gdb.read_register("satp")?;
@@ -333,12 +537,49 @@ fn exercise(
                     descriptor != 0 && descriptor & 0xfff == 0,
                     "invalid descriptor"
                 );
-                // repr(C) immutable Dependency: stem, root index, entry, stack, tables.
+                // repr(C) immutable PreparedModule: stem, root index, entry, stack, tables.
                 let record = gdb.read_physical(descriptor, 40)?;
                 let entry = u64::from_le_bytes(record[16..24].try_into().unwrap());
+                let sibling_slot = gdb
+                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 8 + extra * 8)?
+                    .physical_address;
+                let sibling_descriptor =
+                    u64::from_le_bytes(gdb.read_physical(sibling_slot, 8)?.try_into().unwrap())
+                        & !(1 << 63);
                 let caller = gdb.read_register("satp")?;
                 let available_before = free_frames(gdb, caller)?;
                 let context_va = 0xffff_ffc0_0021_0000;
+                // repr(C) ModuleContext: 32 registers and five header words before cached roots.
+                let roots_va = context_va + 37 * 8;
+                let hart_mmu = gdb
+                    .translate(caller, 0xffff_ffc0_0000_6000)?
+                    .physical_address;
+                let mask = u16::from_le_bytes(gdb.read_physical(hart_mmu, 2)?.try_into().unwrap());
+                let next_tag = gdb.read_physical(hart_mmu + 8, 8)?;
+                let exhausted_mask = mask.max(1);
+                gdb.write_physical(hart_mmu, &exhausted_mask.to_le_bytes())?;
+                gdb.write_physical(hart_mmu + 8, &(u64::from(exhausted_mask) + 1).to_le_bytes())?;
+                let rollback = breakpoint(gdb, payload, "tau_test_progress")?;
+                until(gdb, &rollback, &failed, deadline).context("reject exhausted ASIDs")?;
+                ensure!(gdb.read_register("a2")? == 0, "wrong rollback checkpoint");
+                ensure!(
+                    gdb.read_register("satp")? == caller,
+                    "failed invocation switched roots"
+                );
+                ensure!(
+                    free_frames(gdb, caller)? == available_before,
+                    "failed context construction leaked pages"
+                );
+                let empty_slot = gdb
+                    .translate(caller, roots_va + value * 8)?
+                    .physical_address;
+                ensure!(
+                    gdb.read_physical(empty_slot, 8)? == 0u64.to_le_bytes(),
+                    "failed construction published a root"
+                );
+                gdb.write_physical(hart_mmu, &mask.to_le_bytes())?;
+                gdb.write_physical(hart_mmu + 8, &next_tag)?;
+                gdb.remove_breakpoint(&rollback)?;
                 let thread_va = 0xffff_ffc0_0020_0000;
                 let caller_context = gdb.translate(caller, context_va)?.physical_address;
                 let caller_thread = gdb.translate(caller, thread_va)?.physical_address;
@@ -349,17 +590,20 @@ fn exercise(
                 let destination = gdb.hardware_breakpoint(entry)?;
                 loop {
                     until(gdb, &destination, &failed, deadline)
-                        .context("enter separate sdio address space")?;
+                        .context("enter separate dummy-test address space")?;
                     if gdb.read_register("satp")? != caller {
                         break;
                     }
                 }
                 let callee = gdb.read_register("satp")?;
-                let hart_mmu = gdb
-                    .translate(caller, 0xffff_ffc0_0000_6000)?
+                let bound_slot = gdb
+                    .translate(callee, 0xffff_ffc0_0022_0010)?
                     .physical_address;
-                let mask_bytes = gdb.read_physical(hart_mmu, 2)?;
-                let mask = u16::from_le_bytes(mask_bytes.try_into().unwrap());
+                ensure!(
+                    gdb.read_physical(bound_slot, 8)?
+                        == (sibling_descriptor | (1 << 63)).to_le_bytes(),
+                    "loader binding does not refer to the sibling descriptor"
+                );
                 if mask != 0 {
                     ensure!((callee >> 44) & 0xffff == 1, "callee lacks distinct ASID");
                     ensure!((caller >> 44) & 0xffff == 0, "bootstrap tag changed");
@@ -402,13 +646,143 @@ fn exercise(
                         .is_some_and(|p| !p.user),
                     "context metadata is user accessible"
                 );
-                for name in [
-                    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "gp",
-                    "tp",
-                ] {
+                let fresh_registers = [
+                    "ra", "sp", "gp", "tp", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s0", "s1",
+                    "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "a6", "a7",
+                ];
+                for name in fresh_registers {
                     ensure!(gdb.read_register(name)? == 0, "callee inherited {name}");
                 }
+                let available_first = free_frames(gdb, caller)?;
+                ensure!(
+                    available_first < available_before,
+                    "cold invocation allocated no context"
+                );
+                // Exercise a warm switch with a forced flush, then normal tagged switches.
+                gdb.write_physical(hart_mmu + 2, &[1])?;
+                loop {
+                    until(gdb, &destination, &failed, deadline)?;
+                    if gdb.read_register("satp")? != caller {
+                        break;
+                    }
+                }
+                ensure!(
+                    gdb.read_register("satp")? == callee,
+                    "warm invocation replaced its root or ASID"
+                );
+                ensure!(
+                    free_frames(gdb, caller)? == available_first,
+                    "warm invocation allocated pages"
+                );
+                for name in fresh_registers {
+                    ensure!(
+                        gdb.read_register(name)? == 0,
+                        "warm invocation retained {name}"
+                    );
+                }
+                gdb.write_physical(hart_mmu + 2, &[0])?;
+                loop {
+                    until(gdb, &destination, &failed, deadline)?;
+                    if gdb.read_register("satp")? != caller {
+                        break;
+                    }
+                }
+                let sibling = gdb.read_register("satp")?;
+                ensure!(
+                    sibling != callee && sibling != caller,
+                    "sibling dependency reused another context"
+                );
+                if mask != 0 {
+                    ensure!(
+                        (sibling >> 44) & 0xffff == 2,
+                        "sibling reused an ASID at the same call depth"
+                    );
+                }
+                let available_second = free_frames(gdb, caller)?;
+                ensure!(
+                    available_second < available_first,
+                    "sibling context was not constructed lazily"
+                );
+                loop {
+                    until(gdb, &destination, &failed, deadline)?;
+                    if gdb.read_register("satp")? != caller {
+                        break;
+                    }
+                }
+                ensure!(
+                    gdb.read_register("satp")? == sibling,
+                    "sibling's warm invocation replaced its root"
+                );
+                ensure!(
+                    free_frames(gdb, caller)? == available_second,
+                    "sibling's warm invocation allocated pages"
+                );
                 gdb.remove_breakpoint(&destination)?;
+                let warm = breakpoint(gdb, payload, "tau_test_progress")?;
+                until(gdb, &warm, &failed, deadline)
+                    .context("finish context construction and private mappings")?;
+                check_case(gdb, case)?;
+                ensure!(gdb.read_register("a2")? == 1, "wrong warm checkpoint");
+                gdb.remove_breakpoint(&warm)?;
+                let available_warm = free_frames(gdb, caller)?;
+                let private_first = gdb.translate(callee, 0x1_0000_0000)?.physical_address;
+                let private_second = gdb.translate(sibling, 0x1_0000_0000)?.physical_address;
+                ensure!(
+                    private_first != private_second,
+                    "private mappings alias sibling context"
+                );
+                for (slot, root) in [(value, callee), (extra, sibling)] {
+                    let cached = gdb.translate(caller, roots_va + slot * 8)?.physical_address;
+                    ensure!(
+                        gdb.read_physical(cached, 8)? == root.to_le_bytes(),
+                        "caller did not retain dependency satp"
+                    );
+                    let own_root = gdb.translate(root, context_va + 35 * 8)?.physical_address;
+                    ensure!(
+                        gdb.read_physical(own_root, 8)? == root.to_le_bytes(),
+                        "context does not store its own root"
+                    );
+                    let child_cache = gdb.translate(root, roots_va + extra * 8)?;
+                    ensure!(
+                        child_cache.permissions.is_some_and(|p| !p.user),
+                        "dependency cache is user accessible"
+                    );
+                    ensure!(
+                        gdb.read_physical(child_cache.physical_address, 8)? == 0u64.to_le_bytes(),
+                        "dependency cache is shared with caller"
+                    );
+                }
+                let nested_slot = gdb.translate(callee, roots_va + 8)?.physical_address;
+                let nested =
+                    u64::from_le_bytes(gdb.read_physical(nested_slot, 8)?.try_into().unwrap());
+                ensure!(
+                    nested != 0 && nested != sibling && nested != callee,
+                    "different dependency paths shared a context"
+                );
+                if mask != 0 {
+                    ensure!(
+                        (nested >> 44) & 0xffff == 3,
+                        "nested context lacks a stable unique ASID"
+                    );
+                }
+                ensure!(
+                    gdb.translate(nested, entry)?.physical_address
+                        == gdb.translate(sibling, entry)?.physical_address,
+                    "same module contexts do not share ELF backing"
+                );
+                ensure!(
+                    gdb.translate(nested, context_va)?.physical_address
+                        != gdb.translate(sibling, context_va)?.physical_address,
+                    "nested metadata is shared"
+                );
+                ensure!(
+                    gdb.translate(nested, 0xffff_ffc0_0022_0000)?
+                        .physical_address
+                        == gdb
+                            .translate(sibling, 0xffff_ffc0_0022_0000)?
+                            .physical_address,
+                    "same module contexts do not share module tables"
+                );
                 until(gdb, &passed, &failed, deadline)
                     .context("complete repeated module invocations")?;
                 check_case(gdb, case)?;
@@ -418,9 +792,28 @@ fn exercise(
                 );
                 ensure!(gdb.read_register("a1")? == 128, "wrong invocation count");
                 ensure!(
-                    free_frames(gdb, caller)? == available_before,
-                    "invocation/private mapping pages leaked"
+                    free_frames(gdb, caller)? == available_warm,
+                    "warm invocations or failed preparations changed retained page count"
                 );
+                ensure!(
+                    gdb.translate(callee, 0x1_0000_0000)?.physical_address == private_first,
+                    "return replaced private backing"
+                );
+                ensure!(
+                    gdb.translate(sibling, 0x1_0000_0000)?.physical_address == private_second,
+                    "return replaced sibling private backing"
+                );
+                ensure!(
+                    gdb.read_physical(nested_slot, 8)? == nested.to_le_bytes(),
+                    "nested warm invocation replaced its root"
+                );
+                for root in [callee, sibling, nested] {
+                    let link = gdb.translate(root, context_va + 33 * 8)?.physical_address;
+                    ensure!(
+                        gdb.read_physical(link, 8)? == 0u64.to_le_bytes(),
+                        "idle context retained a caller link"
+                    );
+                }
                 return Ok(());
             }
             4 => {
@@ -451,6 +844,10 @@ fn exercise(
     }
     until(gdb, &passed, &failed, deadline).context("reach success checkpoint")?;
     check_case(gdb, case)?;
+    if case.id == 7 {
+        ensure!(gdb.read_register("a1")? == 128, "wrong scheduling round count");
+        ensure!(gdb.read_register("satp")? == satp, "scheduler did not restore initial context");
+    }
     if case.id == 1 {
         ensure!(gdb.read_register("a1")? == hart, "boot hart changed");
     }
@@ -459,7 +856,11 @@ fn exercise(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        breakpoint, exercise, fs, selected, until, validate_control, Build, Case, Context,
+        Duration, ElfImage, Instant, PathBuf, Result, SymbolMapping, TestVm, Timeout, VmConfig,
+        MAGIC, VERSION, ensure,
+    };
 
     #[test]
     fn control_rejects_incompatible_or_reused_payloads() {
@@ -482,8 +883,9 @@ mod tests {
 
     #[test]
     fn selection_does_not_silently_run_everything_on_a_typo() {
-        assert_eq!(selected(None).len(), 5);
+        assert_eq!(selected(None).len(), 8);
         assert_eq!(selected(Some("invocation"))[0].id, 5);
+        assert_eq!(selected(Some("graph"))[0].id, 6);
         assert_eq!(selected(Some("timer"))[0].id, 3);
         assert!(selected(Some("timre")).is_empty());
     }
@@ -557,7 +959,7 @@ mod tests {
                 )
             })
             .unwrap_err();
-        ensure!(error.is::<crate::debugger::Timeout>(), "{error:#}");
+        ensure!(error.is::<Timeout>(), "{error:#}");
         let diagnostics = fs::read_to_string(vm.artifacts().join("diagnostics.txt"))?;
         ensure!(
             diagnostics.contains("pc:"),

@@ -8,7 +8,7 @@ name = "tau"
 path = "src/main.rs"
 
 [dependencies]
-object = { version = "0.40.0", default-features = false, features = ["read"] }
+object = { version = "0.40.0", default-features = false, features = ["read", "build"] }
 clap = { version = "4.6", features = ["derive"] }
 thiserror = { version = "2.0" }
 crc = { version = "3.4" }

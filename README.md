@@ -31,9 +31,9 @@ modules, a reserved 64 KiB boot DTB buffer, and its scratch pages to fit
 within the initial 2 MiB mapping.
 
 All listed binaries are built and packed. `loader` and `supervisor` are flattened;
-U-mode binaries remain ELF. `compose_tau_image_from` uses the active Rust
-toolchain’s `llvm-objcopy --strip-all` to produce temporary packed copies.
-Install the `llvm-tools` component (already listed in the OS toolchain file).
+U-mode binaries remain ELF. `compose_tau_image_from` uses the `object` crate to
+strip non-runtime symbols and sections from packed copies in memory, preserving runtime sections and
+RISC-V attributes. No external stripping tool is required.
 The original ELF files and Cargo’s `debug = 2`, `strip = "none"` remain unchanged.
 
 The loader copies the firmware DTB into reserved RAM and adds
@@ -48,7 +48,9 @@ Both S-mode binaries use the same generated system/test selection constants.
 Supervisor forwards the new DTB address and page count through the original
 `a2`/`a3` boot arguments. `system` finds module ranges with `Dtb::boot_module`
 and maps them through `Area::sl`; there is no manifest or static-variable
-patching. The dummy `sdio` ELF is prepared by `system` and invoked in a separate address space.
+patching. The `dummy-test` ELF is prepared by `system` and invoked in a separate address space.
+The `graph` scenario prepares and binds shared dependencies through the loader syscalls,
+then walks both application paths and checks shared module state and retained roots.
 
 The DTB writer can be checked on the host against both board trees and malformed
 input with `cargo test --test dtb_writer -- --ignored`. After a normal QEMU
@@ -85,7 +87,9 @@ and 4 GiB of RAM. It currently covers:
 | --- | --- |
 | `boot` | U-mode execution, user executable code mapping, DTB boot arguments, discovery and mapping of all three U-mode ELFs |
 | `mapping` | Map two pages through UBI; verify contents, distinct physical pages, user read/write and non-executable permissions |
-| `timer` | UBI wait returns a timeout after the requested guest-time deadline |
+| `timer` | Bootstrap interrupt wait returns after the requested guest-time deadline |
+| `scheduling` | Software waits, notification, deadlines, preemption, register restoration, and waits inside module calls |
+| `spawn-rollback` | ASID exhaustion rolls back thread creation before a later successful spawn |
 | `invocation` | Separate roots and private contexts, shared thread metadata, register restoration, shared globals/BSS, module authority, 128 calls, and reclaimed private pages |
 | `fault` | Deliberate unmapped load traps from U-mode with the expected cause, address, and faulting instruction |
 

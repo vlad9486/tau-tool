@@ -43,7 +43,7 @@ fn property(name: &str, bytes: &[u8], node: &str, property: &str, kind: &str) ->
 }
 fn write(source: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let module = layout::StaticModule {
-        name: *b"sdio\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        name: *b"dummy-test\0\0\0\0\0\0\0\0\0\0",
         offset: 0x57,
         pages: 8,
         user: true,
@@ -77,7 +77,7 @@ fn preserves_chosen_properties_children_and_reservations() {
             "tau,name",
             "s"
         ),
-        "sdio"
+        "dummy-test"
     );
     assert_eq!(
         property(
@@ -105,7 +105,7 @@ fn creates_chosen_and_supports_multiple_modules() {
             user: true,
         },
         layout::StaticModule {
-            name: *b"sdio\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            name: *b"dummy-test\0\0\0\0\0\0\0\0\0\0",
             offset: 32,
             pages: 8,
             user: true,
@@ -140,7 +140,7 @@ fn creates_chosen_and_supports_multiple_modules() {
             "tau,name",
             "s"
         ),
-        "sdio"
+        "dummy-test"
     );
 }
 
@@ -184,7 +184,7 @@ fn both_board_trees_fit_the_reserved_buffer() {
                 "tau,name",
                 "s"
             ),
-            "sdio"
+            "dummy-test"
         );
         // The independent compiler validates the complete resulting tree.
         let input = directory().join(format!("{name}-output.dtb"));
