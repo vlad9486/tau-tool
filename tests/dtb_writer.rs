@@ -16,14 +16,17 @@ fn boot_dtb_writer() -> Result<()> {
     let (_, writer) = loader
         .split_once("\nmod boot_dtb {")
         .context("loader's boot_dtb module")?;
-    let layout = fs::read_to_string(root.join("2-S/src/layout.rs"))?;
-    let (layout, _) = layout
+    let (_, static_module_rest) = loader
+        .split_once("pub struct StaticModule")
+        .context("StaticModule definition")?;
+    let (static_module, _) = static_module_rest
         .split_once("include!(")
         .context("static module layout declaration")?;
+    let layout = format!("pub struct StaticModule {static_module}");
     fs::write(
         &harness,
         format!(
-            "extern crate self as supervisor;\npub mod layout {{ {layout} }}\n\
+            "extern crate self as supervisor;\npub mod layout {{ {layout} }}\npub use layout::StaticModule;\n\
              mod boot_dtb {{ {writer}\nuse boot_dtb as writer;\n{}",
             include_str!("fixtures/dtb_writer.rs")
         ),

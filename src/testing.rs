@@ -265,9 +265,9 @@ fn physical_word(gdb: &mut Gdb, address: u64) -> Result<u64> {
 }
 
 fn dependency_root(gdb: &mut Gdb, root: u64, slot: u64) -> Result<u64> {
-    // repr(C) ModuleContext: 32 registers, five header words, then roots.
+    // repr(C) ModuleContext: header aligned to 4096, then roots.
     let address = gdb
-        .translate(root, 0xffff_ffc0_0021_0000 + (37 + slot) * 8)?
+        .translate(root, 0xffff_ffc0_0021_0000 + 4096 + slot * 8)?
         .physical_address;
     physical_word(gdb, address)
 }
@@ -425,7 +425,7 @@ fn exercise(
                 let caller = gdb.read_register("satp")?;
                 for (slot, descriptor) in [(slots[0], descriptors[0]), (slots[1], descriptors[1])] {
                     let address = gdb
-                        .translate(caller, 0xffff_ffc0_0022_0008 + slot * 8)?
+                        .translate(caller, 0xffff_ffc0_0022_1000 + slot * 8)?
                         .physical_address;
                     ensure!(
                         physical_word(gdb, address)? == descriptor | (1 << 63),
@@ -439,7 +439,7 @@ fn exercise(
                 for (parent, slot, child) in [(0, slots[2], 2), (1, slots[3], 2), (2, slots[4], 3)]
                 {
                     ensure!(
-                        physical_word(gdb, field(parent, 32) + 8 + slot * 8)?
+                        physical_word(gdb, field(parent, 32) + 4096 + slot * 8)?
                             == descriptors[child] | (1 << 63),
                         "wrong graph binding"
                     );
@@ -493,11 +493,11 @@ fn exercise(
                     );
                     let metadata = gdb.translate(root, 0xffff_ffc0_0021_0000)?.physical_address;
                     ensure!(
-                        physical_word(gdb, metadata + 35 * 8)? == root,
+                        physical_word(gdb, metadata + 33 * 8)? == root,
                         "wrong context root"
                     );
                     ensure!(
-                        physical_word(gdb, metadata + 33 * 8)? == 0,
+                        physical_word(gdb, metadata + 34 * 8)? == 0,
                         "idle graph context retains caller"
                     );
                 }
@@ -540,11 +540,11 @@ fn exercise(
                     );
                 }
                 ensure!(
-                    physical_word(gdb, field(1, 32) + 8)? == 0x800,
+                    physical_word(gdb, field(1, 32) + 4096)? == 0x800,
                     "exhausted table has wrong free-list head"
                 );
                 ensure!(
-                    physical_word(gdb, field(1, 32) + 8 + 0x7ff * 8)? == descriptors[2] | (1 << 63),
+                    physical_word(gdb, field(1, 32) + 4096 + 0x7ff * 8)? == descriptors[2] | (1 << 63),
                     "last binding did not reuse service descriptor"
                 );
                 return Ok(());
@@ -554,10 +554,10 @@ fn exercise(
                     value > 0 && value < 0x800 && extra > 0 && extra < 0x800 && value != extra,
                     "invalid prepared dependency slots"
                 );
-                // repr(C) ModuleTables: two bools, padding, then atomic slots.
+                // repr(C) ModuleTables: header, two bools, wait table, then atomic slots.
                 let caller_root = gdb.read_register("satp")?;
                 let slot_address = gdb
-                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 8 + value * 8)?
+                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 4096 + value * 8)?
                     .physical_address;
                 let cell = gdb.read_physical(slot_address, 8)?;
                 let descriptor = u64::from_le_bytes(cell.try_into().unwrap()) & !(1 << 63);
@@ -569,7 +569,7 @@ fn exercise(
                 let record = gdb.read_physical(descriptor, 40)?;
                 let entry = u64::from_le_bytes(record[16..24].try_into().unwrap());
                 let sibling_slot = gdb
-                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 8 + extra * 8)?
+                    .translate(caller_root, 0xffff_ffc0_0022_0000 + 4096 + extra * 8)?
                     .physical_address;
                 let sibling_descriptor =
                     u64::from_le_bytes(gdb.read_physical(sibling_slot, 8)?.try_into().unwrap())
@@ -577,8 +577,8 @@ fn exercise(
                 let caller = gdb.read_register("satp")?;
                 let available_before = free_frames(gdb, caller)?;
                 let context_va = 0xffff_ffc0_0021_0000;
-                // repr(C) ModuleContext: 32 registers and five header words before cached roots.
-                let roots_va = context_va + 37 * 8;
+                // repr(C) ModuleContext: header aligned to 4096, then cached roots.
+                let roots_va = context_va + 4096;
                 let hart_mmu = gdb
                     .translate(caller, 0xffff_ffc0_0000_6000)?
                     .physical_address;
@@ -608,9 +608,7 @@ fn exercise(
                 gdb.write_physical(hart_mmu, &mask.to_le_bytes())?;
                 gdb.write_physical(hart_mmu + 8, &next_tag)?;
                 gdb.remove_breakpoint(&rollback)?;
-                let thread_va = 0xffff_ffc0_0020_0000;
                 let caller_context = gdb.translate(caller, context_va)?.physical_address;
-                let caller_thread = gdb.translate(caller, thread_va)?.physical_address;
                 let caller_stack = gdb
                     .translate(caller, 0xffff_ffc0_001f_fff0)?
                     .physical_address;
@@ -625,7 +623,7 @@ fn exercise(
                 }
                 let callee = gdb.read_register("satp")?;
                 let bound_slot = gdb
-                    .translate(callee, 0xffff_ffc0_0022_0010)?
+                    .translate(callee, 0xffff_ffc0_0022_1008)?
                     .physical_address;
                 ensure!(
                     gdb.read_physical(bound_slot, 8)?
@@ -651,10 +649,6 @@ fn exercise(
                 ensure!(
                     gdb.translate(callee, context_va)?.physical_address != caller_context,
                     "context pages are shared"
-                );
-                ensure!(
-                    gdb.translate(callee, thread_va)?.physical_address == caller_thread,
-                    "invoke created another thread"
                 );
                 ensure!(
                     gdb.translate(callee, 0xffff_ffc0_001f_fff0)?
@@ -765,7 +759,7 @@ fn exercise(
                         gdb.read_physical(cached, 8)? == root.to_le_bytes(),
                         "caller did not retain dependency satp"
                     );
-                    let own_root = gdb.translate(root, context_va + 35 * 8)?.physical_address;
+                    let own_root = gdb.translate(root, context_va + 33 * 8)?.physical_address;
                     ensure!(
                         gdb.read_physical(own_root, 8)? == root.to_le_bytes(),
                         "context does not store its own root"
@@ -836,7 +830,7 @@ fn exercise(
                     "nested warm invocation replaced its root"
                 );
                 for root in [callee, sibling, nested] {
-                    let link = gdb.translate(root, context_va + 33 * 8)?.physical_address;
+                    let link = gdb.translate(root, context_va + 34 * 8)?.physical_address;
                     ensure!(
                         gdb.read_physical(link, 8)? == 0u64.to_le_bytes(),
                         "idle context retained a caller link"

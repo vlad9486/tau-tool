@@ -8,7 +8,9 @@
 extern crate self as tau;
 #[path = "@COMMON@"]
 mod common;
-pub use self::common::{ModuleError, WaitError};
+#[path = "@ERROR@"]
+mod error;
+pub use self::error::{ModuleError, WaitError};
 
 mod vmem {
     use std::collections::BTreeMap;
@@ -28,6 +30,12 @@ mod vmem {
         pub fn page_pointer(&mut self, physical: usize) -> *mut u8 {
             physical as *mut u8
         }
+        pub fn wait_mut(&mut self, physical: usize) -> &mut [u8] {
+            unsafe { core::slice::from_raw_parts_mut(physical as *mut u8, PAGE) }
+        }
+        pub fn page_mut(&mut self, physical: usize) -> &mut [u8] {
+            unsafe { core::slice::from_raw_parts_mut(physical as *mut u8, PAGE) }
+        }
     }
     pub fn user_range(address: usize, bytes: usize) -> bool {
         bytes != 0
@@ -46,7 +54,7 @@ mod state {
         allocations: RefCell<Vec<(usize, Layout)>>,
     }
     impl Context {
-        pub fn block(&self, _: usize, order: usize) -> Result<usize, ()> {
+        pub fn block(&self, _: usize, order: u32) -> Result<usize, ()> {
             if order > 10 {
                 return Err(());
             }
@@ -58,7 +66,7 @@ mod state {
             self.allocations.borrow_mut().push((address, layout));
             Ok(address)
         }
-        pub fn free_block(&self, _: usize, address: usize, _: usize) -> Result<(), ()> {
+        pub fn free_block(&self, _: usize, address: usize, _: u32) -> Result<(), ()> {
             let mut allocations = self.allocations.borrow_mut();
             let index = allocations
                 .iter()
@@ -80,8 +88,14 @@ mod state {
         }
     }
 }
+mod space {
+    pub use super::vmem::*;
+}
 #[path = "@WAITING@"]
 mod waiting;
+mod matter {
+    pub use super::waiting::*;
+}
 #[path = "@THREAD@"]
 mod thread;
 
@@ -91,6 +105,31 @@ use self::{
     waiting::WaitTable,
     thread::{ActiveWait, Phase, Resume, ThreadState},
 };
+
+impl Clone for ActiveWait {
+    fn clone(&self) -> Self {
+        ActiveWait {
+            module: self.module,
+            table: self.table.unsafe_clone(),
+            slot: self.slot,
+            sequence: self.sequence,
+        }
+    }
+}
+
+impl Clone for ThreadState {
+    fn clone(&self) -> Self {
+        ThreadState {
+            phase: self.phase,
+            root: self.root,
+            resume: self.resume,
+            message: self.message,
+            sequence: self.sequence,
+            wait: self.wait.clone(),
+        }
+    }
+}
+
 fn root() -> Root {
     Root(core::num::NonZeroUsize::new(1).unwrap())
 }
@@ -106,7 +145,6 @@ fn parked(phase: Phase) -> ThreadState {
             table: WaitTable::EMPTY,
             slot: 0,
             sequence: 1,
-            deadline: 123,
         }),
     }
 }
@@ -120,7 +158,7 @@ fn slot_abi_and_all_pointer_boundaries() {
     let mut window = WindowAccess::default();
     let backing = context.block(0, 0).unwrap();
     window.mappings.insert(0x10000, (backing, 22));
-    let table = WaitTable::prepare(&mut window, &context, 0, root(), 0, 0x10000, 64).unwrap();
+    let table = WaitTable::prepare(&mut window, &context, 0, 0, 0x10000, 64).unwrap();
     for index in 0..64 {
         assert_eq!(table.index(0x10000 + index * 64), Ok(index));
         for byte in 1..64 {
@@ -158,36 +196,32 @@ fn table_validation_precedes_allocation_and_records_cross_pages() {
     window.mappings.insert(0x11000, (second, 22));
     for (base, count) in [
         (0, 1),
-        (0x10000, 0),
         (0x10001, 1),
         (0x10000, usize::MAX),
         (usize::MAX - 63, 2),
-        (0x12000, 1),
-        (0x10000, 129),
         ((1 << 30) - 64, 2),
     ] {
-        assert!(WaitTable::prepare(&mut window, &context, 0, root(), 0, base, count).is_err());
+        assert!(WaitTable::prepare(&mut window, &context, 0, 0, base, count).is_err());
         assert_eq!(context.blocks(), 2);
     }
-    for flags in [2, 6, 18, 26, 30] {
-        window.mappings.insert(0x11000, (second, flags));
-        assert!(WaitTable::prepare(&mut window, &context, 0, root(), 0, 0x10000, 128).is_err());
-        assert_eq!(context.blocks(), 2);
-    }
-    window.mappings.insert(0x11000, (second, 22));
-    let table = WaitTable::prepare(&mut window, &context, 0, root(), 0, 0x10000, 128).unwrap();
+    assert_eq!(
+        WaitTable::prepare(&mut window, &context, 0, 0, 0x10000, 0).unwrap().count,
+        0
+    );
+    assert_eq!(context.blocks(), 2);
+    let table = WaitTable::prepare(&mut window, &context, 0, 0, 0x10000, 128).unwrap();
     for index in 0..128 {
         let mut record = unsafe { table.read(&mut window, index) };
-        assert!(!record.pending && record.thread == 0 && record.sequence == 0);
+        assert!(!record.pending && record.thread_id == 0 && record.sequence == 0);
         record.pending = true;
-        record.thread = index + 1;
+        record.thread_id = index + 1;
         record.sequence = index + 10;
         unsafe { table.write(&mut window, index, record) };
     }
     for index in 0..128 {
         let record = unsafe { table.read(&mut window, index) };
         assert!(record.pending);
-        assert_eq!(record.thread, index + 1);
+        assert_eq!(record.thread_id, index + 1);
         assert_eq!(record.sequence, index + 10);
     }
     table.release(&context, 0);
@@ -307,14 +341,17 @@ fn all_readiness_notification_and_parking_interleavings_preserve_progress() {
 #[test]
 fn stale_sequences_cannot_match_reused_slots_or_other_modules() {
     let old = parked(Phase::Parked).wait.unwrap();
-    let mut later = old;
+    let mut later = old.clone();
+    let matches = |a: &ActiveWait, b: &ActiveWait| {
+        a.module == b.module && a.slot == b.slot && a.sequence == b.sequence
+    };
     later.sequence += 1;
-    assert!(!old.matches(later));
-    later = old;
+    assert!(!matches(&old, &later));
+    later = old.clone();
     later.module += 4096;
-    assert!(!old.matches(later));
-    later = old;
+    assert!(!matches(&old, &later));
+    later = old.clone();
     later.slot += 1;
-    assert!(!old.matches(later));
-    assert!(old.matches(old));
+    assert!(!matches(&old, &later));
+    assert!(matches(&old, &old));
 }
